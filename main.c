@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include "bits.h"
+#include "../elf-reader/elf-reader.h"
 
 #define fatal(s, ...) do {printf("%04d: %s : %s\n",__LINE__, strerror(errno), s, ##__VA_ARGS__); \
 	exit(1);} while(0)
@@ -79,6 +80,7 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
     vm->mem = mmap(NULL, vm->phy_mem_size, PROT_READ | PROT_WRITE,
 	       MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
 
+    // should check MAP_FAILED TBD
     if(!vm->mem)
 	fatal("cant mmap\n");
     // set up memory mapping
@@ -218,24 +220,46 @@ uint8_t code[] =
 {
 #include "code.h"
 };
+
+const char limit_file[] = "../elf-reader/limits.txt";
+const char executable[] = "../test/main";
+
 int setup_code(struct vm *vm)
 {
     int ret;
-    struct kvm_regs regs = {
-	.rip = CODE_START + 4,
-	.rax = 2,
-	.rbx = 2,
-	.rsp = STACK_START, /* temporary stack */
-	.rdi = STACK_START, /* start of free pages */
-	.rsi = 0, /* total length of free pages */	
-	.rflags = 0x2
-    };    
-    ret = ioctl(vm->vcpufd, KVM_SET_REGS, &regs);
+    int i, sz;
+    void *saddr;
+    Elf64_Addr daddr;
+    
+    struct elf64_file elf;
     if(ret == -1)
 	fatal("cant set regs\n");
 
-    memcpy(&vm->mem[CODE_START], code, sizeof(code));
+    init_limits(limit_file);
+    init_elf64_file(executable, &elf);
+
+    for(i = 0; i < elf.num_regions; i++) {
+	daddr = elf.prog_regions[i]->vaddr;
+	saddr = elf.prog_regions[i]->addr;
+	sz = elf.prog_regions[i]->filesz;
+	memcpy(&vm->mem[daddr], saddr, sz);
+    }
     
+    {
+	struct kvm_regs regs = {
+	    .rip = elf.ehdr.e_entry,
+	    .rax = 2,
+	    .rbx = 2,
+	    .rsp = STACK_START, /* temporary stack */
+	    .rdi = STACK_START,
+	    .rsi = 0,
+	    .rflags = 0x2
+	};    
+	ret = ioctl(vm->vcpufd, KVM_SET_REGS, &regs);
+    }
+    
+    fini_elf64_file(&elf);
+    return 0;
 }
 
 int print_regs(struct vm *vm)
