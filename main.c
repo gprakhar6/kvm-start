@@ -3,21 +3,29 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <time.h>
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 
-#define fatal(s, ...) do {printf("%04d: %s : %s\n",__LINE__, strerror(errno), s, ##__VA_ARGS__); \
-	exit(1);} while(0)
+#define fatal(s, ...) do {\
+	printf("%04d: %s :",__LINE__, strerror(errno));			\
+	printf(s, ##__VA_ARGS__);					\
+	exit(1);							\
+    } while(0)
 #define ONE_PAGE (0x1000)
 #define MAX_KERN_SIZE (16 * ONE_PAGE)
 #define CODE_START (0x1000)
 #define STACK_START (0xA000)
+
+#define ts(x) (gettimeofday(&x, NULL))
+#define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
 
 struct vm {
     int fd;
@@ -26,39 +34,79 @@ struct vm {
     unsigned int phy_mem_size;
     struct kvm_run *run;
     struct kvm_sregs sregs;
-    struct kvm_regs regs;    
+    struct kvm_regs regs;
+    struct kvm_debugregs dregs;
 };
 
+const char bootfile[] = "../boot/main.bin";
+
+struct timeval t1, t2;
+
 int get_vm(struct vm *vm);
+int get_regs_sregs(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
 int setup_vm_long_mode(struct vm *vm);
+int setup_seg_real_mode(struct vm *vm);
+int setup_seg(struct vm *vm);
+int setup_bootcode(struct vm *vm);
 int setup_code(struct vm *vm);
 int print_regs(struct vm *vm);
-
+void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 int main()
 {
     int ret;
     struct vm vm;
+    char c;
+    static uint32_t pcnt = 0;
     
+    ts(t1);
     get_vm(&vm);
-    setup_guest_phy2_host_virt_map(&vm);
-    setup_vm_long_mode(&vm);
-    setup_code(&vm);
+    setup_guest_phy2_host_virt_map(&vm);    
+    get_regs_sregs(&vm);
+    setup_seg_real_mode(&vm);    
+    setup_bootcode(&vm);
+    //setup_vm_long_mode(&vm);
+    //ts(t2);
+    //printf("setuptime = %ld us\n", dt(t2,t1));
+    //setup_code(&vm);
+    ts(t1);
     while(1) {
 	ret = ioctl(vm.vcpufd, KVM_RUN, NULL);
 	if(ret == -1)
 	    fatal("KVM_RUN ERROR\n");
 
-	printf("exit reason = %d\n", vm.run->exit_reason);
+	//printf("exit reason = %d\n", vm.run->exit_reason);
+	//print_regs(&vm);	
 	switch(vm.run->exit_reason) {
 	case KVM_EXIT_HLT:
+	    ts(t2);
+	    printf("time = %ld\n", dt(t2, t1));
 	    goto finish;
 	    break;
 	case KVM_EXIT_IO:
-	    break;
-	case KVM_EXIT_FAIL_ENTRY:
+	    if (vm.run->io.direction == KVM_EXIT_IO_OUT &&
+		vm.run->io.size == 1 && vm.run->io.port == 0x3f8 &&
+		vm.run->io.count == 1) {
+		c = *(((char *)vm.run) + vm.run->io.data_offset);
+		printf("%02x", (unsigned char)c);
+		pcnt++;
+		if(pcnt%4 == 0) printf(" ");
+		    
+		if(pcnt%8 == 0) printf("\n");
+	    }
+	    else {
+		print_regs(&vm);
+		fatal("unhandled KVM_EXIT_IO, %X\n", vm.run->io.port);
+	    }
+	    break;	    
+	case KVM_EXIT_SHUTDOWN:
+	    fatal("KVM_EXIT_SHUTDOWN\n");
 	    break;
 	case KVM_EXIT_INTERNAL_ERROR:
+	    fatal("KVM_EXIT_INTERNAL_ERROR\n");
+	    break;
+	case KVM_EXIT_FAIL_ENTRY:
+	    fatal("KVM_EXIT_FAIL_ENTRY\n");
 	    break;
 	default:
 	    break;   
@@ -103,8 +151,9 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
 int get_vm(struct vm *vm)
 {
     int kvm, ret, mmap_size;
-    int err;
-
+    int err, nent;
+    struct kvm_cpuid2 *cpuid2;
+    
     err = 0;
     kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if(kvm == -1) {
@@ -127,9 +176,23 @@ int get_vm(struct vm *vm)
     if(mmap_size < sizeof(*vm->run))
 	fatal("really! mmap_size < run. Why?\n");
 
+    nent = 128;
+    cpuid2 =
+	(struct kvm_cpuid2 *)
+	malloc(sizeof(struct kvm_cpuid2)
+	       + nent * sizeof(struct kvm_cpuid_entry2));
+    cpuid2->nent = nent;
+    if(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, cpuid2) < 0)
+	fatal("cant get cpuid");
+    
+    print_cpuid_output(cpuid2);
+    
     vm->vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, (unsigned long)0);
     if(vm->vcpufd == -1)
 	fatal("Cannot create vcpu\n");
+
+    if(ioctl(vm->vcpufd, KVM_SET_CPUID2, cpuid2) < 0)
+	fatal("cannot set cpuid things\n");
     
     vm->run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
 		  MAP_SHARED, vm->vcpufd, 0);
@@ -137,6 +200,19 @@ int get_vm(struct vm *vm)
 	fatal("run error\n");
 
     return err;
+}
+
+int get_regs_sregs(struct vm *vm)
+{
+    int ret;
+    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
+    if(ret == -1)
+	fatal("Cant get sregs\n");
+    
+    ret = ioctl(vm->vcpufd, KVM_GET_REGS, &vm->regs);
+    if(ret == -1)
+	fatal("cant get regs\n");;
+    return ret;
 }
 
 void setup_paging(struct vm *vm)
@@ -171,6 +247,15 @@ void setup_paging(struct vm *vm)
 	fatal("cant set sregs\n");
     
 }
+int setup_seg_real_mode(struct vm *vm)
+{
+    int ret;
+    vm->sregs.cs.base = 0;
+    //vm->sregs.cs.limit = 0xffffffff;    
+    vm->sregs.cs.selector = 0;
+    if(ioctl(vm->vcpufd, KVM_SET_SREGS, &vm->sregs) < 0)
+	fatal("cant set seg sregs");
+}
 
 int setup_seg(struct vm *vm)
 {
@@ -202,27 +287,48 @@ int setup_seg(struct vm *vm)
 int setup_vm_long_mode(struct vm *vm)
 {
     int ret;
-  
-    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
-    if(ret == -1)
-	fatal("Cant get sregs\n");
-    
-    ret = ioctl(vm->vcpufd, KVM_GET_REGS, &vm->regs);
-    if(ret == -1)
-	fatal("cant get regs\n");
 
     setup_paging(vm);
     setup_seg(vm);
     
 }
 
-uint8_t code[] =
-{
-#include "code.h"
-};
-
 const char limit_file[] = "../elf-reader/limits.txt";
 const char executable[] = "../test/main";
+const uint8_t bootcode[] = {
+    #include "code.h"
+};
+int setup_bootcode(struct vm *vm)
+{
+    int ret, i, filesz;
+    FILE *fp;
+
+    fp = fopen(bootfile, "r");
+    if(fp == NULL)
+	fatal("cant open %s\n", bootfile);
+
+    fseek(fp, 0, SEEK_END);
+    filesz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if(fread(&vm->mem[0x1000], filesz, 1, fp) != 1)
+	fatal("cant read %s file\n", bootfile);
+    {
+	struct kvm_regs regs = {
+	    .rip = 0x1000,
+	    .rax = 2,
+	    .rbx = 2,
+	    .rsp = STACK_START, /* temporary stack */
+	    .rbp = STACK_START,
+	    .rdi = 0,
+	    .rsi = 0,	    
+	    .rflags = 0x2
+	};    
+	ret = ioctl(vm->vcpufd, KVM_SET_REGS, &regs);
+	if(ret == -1)
+	    fatal("cant set regs\n");
+    }    
+}
 
 int setup_code(struct vm *vm)
 {
@@ -262,18 +368,60 @@ int setup_code(struct vm *vm)
     return 0;
 }
 
+void print_segment(struct kvm_segment *seg)
+{
+    printf("Base  : 0x%llx\n", seg->base);
+    printf("Limit : 0x%x\n", seg->limit);
+}
+
+void print_cpuid_output(struct kvm_cpuid2 *cpuid2)
+{
+    int i;
+    for(i = 0; i < cpuid2->nent; i++) {
+	printf("----------------%03d----------------\n", i);
+	printf("function    = 0x%08x\n", cpuid2->entries[i].function);
+	printf("index       = 0x%08x\n", cpuid2->entries[i].index   );
+	printf("flags       = 0x%08x\n", cpuid2->entries[i].flags   );
+	printf("eax         = 0x%08x\n", cpuid2->entries[i].eax     );
+	printf("ebx         = 0x%08x\n", cpuid2->entries[i].ebx     );
+	printf("ecx         = 0x%08x\n", cpuid2->entries[i].ecx     );
+	printf("edx         = 0x%08x\n", cpuid2->entries[i].edx     );
+    }
+}
 int print_regs(struct vm *vm)
 {
-    int ret;
+    int ret, i;
+    
     ret = ioctl(vm->vcpufd, KVM_GET_REGS, &vm->regs);
     if(ret == -1)
-	fatal("cant get regs\n");    
-    printf("rip = %llx\n", vm->regs.rip);
-    printf("rax = %llx\n", vm->regs.rax);
-    printf("rbx = %llx\n", vm->regs.rbx);
-    printf("rsp = %llx\n", vm->regs.rsp);
-    printf("rdi = %llx\n", vm->regs.rdi);
-    printf("rsi = %llx\n", vm->regs.rsi);
-    printf("rfl = %llx\n", vm->regs.rflags);
-    
+	fatal("cant get regs\n");
+    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
+    if(ret == -1)
+	fatal("cant get regs\n");
+    ret = ioctl(vm->vcpufd, KVM_GET_DEBUGREGS, &vm->dregs);
+    if(ret == -1)
+	fatal("cant get debug regs\n");    
+    printf("--------------------------------\n");
+    printf("rip    = 0x%016llx\n", vm->regs.rip);
+    printf("rax    = 0x%016llx\n", vm->regs.rax);
+    printf("rbx    = 0x%016llx\n", vm->regs.rbx);
+    printf("rcx    = 0x%016llx\n", vm->regs.rcx);
+    printf("rdx    = 0x%016llx\n", vm->regs.rdx);    
+    printf("rsp    = 0x%016llx\n", vm->regs.rsp);
+    printf("rbp    = 0x%016llx\n", vm->regs.rbp);
+    printf("rdi    = 0x%016llx\n", vm->regs.rdi);
+    printf("rsi    = 0x%016llx\n", vm->regs.rsi);
+    printf("rflags = 0x%016llx\n", vm->regs.rflags);
+    printf("efer   = 0x%016llx\n", vm->sregs.efer);
+    printf("cr0    = 0x%016llx\n", vm->sregs.cr0);
+    printf("cr2    = 0x%016llx\n", vm->sregs.cr2);
+    printf("cr3    = 0x%016llx\n", vm->sregs.cr3);        
+    printf("cr4    = 0x%016llx\n", vm->sregs.cr4);
+    for(i = 0; i < 4; i++)
+	printf("db[%d]  = 0x%016llx\n", i, vm->dregs.db[i]);
+    printf("dr6    = 0x%016llx\n", vm->dregs.dr6);
+    printf("dr7    = 0x%016llx\n", vm->dregs.dr7);
+    printf("flags  = 0x%016llx\n", vm->dregs.flags);
+    print_segment(&vm->sregs.cs);
+    printf("--------------------------------\n");    
 }
