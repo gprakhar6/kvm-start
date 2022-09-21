@@ -185,7 +185,7 @@ int get_vm(struct vm *vm)
     if(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, cpuid2) < 0)
 	fatal("cant get cpuid");
     
-    print_cpuid_output(cpuid2);
+    //print_cpuid_output(cpuid2);
     
     vm->vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, (unsigned long)0);
     if(vm->vcpufd == -1)
@@ -295,9 +295,6 @@ int setup_vm_long_mode(struct vm *vm)
 
 const char limit_file[] = "../elf-reader/limits.txt";
 const char executable[] = "../test/main";
-const uint8_t bootcode[] = {
-    #include "code.h"
-};
 int setup_bootcode(struct vm *vm)
 {
     int ret, i, filesz;
