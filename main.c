@@ -408,6 +408,17 @@ int print_regs(struct vm *vm)
     printf("rbp    = 0x%016llx\n", vm->regs.rbp);
     printf("rdi    = 0x%016llx\n", vm->regs.rdi);
     printf("rsi    = 0x%016llx\n", vm->regs.rsi);
+#define RECUR_CALL(x) printf("r[%02d]    = 0x%016llx\n", x, vm->regs.r ## x)
+    RECUR_CALL(8);
+    RECUR_CALL(9);
+    RECUR_CALL(10);
+    RECUR_CALL(11);
+    RECUR_CALL(12);
+    RECUR_CALL(13);
+    RECUR_CALL(14);
+    RECUR_CALL(15);
+	
+	
     printf("rflags = 0x%016llx\n", vm->regs.rflags);
     printf("efer   = 0x%016llx\n", vm->sregs.efer);
     printf("cr0    = 0x%016llx\n", vm->sregs.cr0);
