@@ -38,8 +38,6 @@ struct vm {
     struct kvm_debugregs dregs;
 };
 
-const char bootfile[] = "../boot/main.bin";
-
 struct timeval t1, t2;
 
 int get_vm(struct vm *vm);
@@ -57,18 +55,17 @@ int main()
     int ret;
     struct vm vm;
     char c;
-    static uint32_t pcnt = 0;
     
     ts(t1);
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);    
     get_regs_sregs(&vm);
     setup_seg_real_mode(&vm);    
-    setup_bootcode(&vm);
+    //setup_bootcode(&vm);
     //setup_vm_long_mode(&vm);
     //ts(t2);
     //printf("setuptime = %ld us\n", dt(t2,t1));
-    //setup_code(&vm);
+    setup_code(&vm);
     ts(t1);
     while(1) {
 	ret = ioctl(vm.vcpufd, KVM_RUN, NULL);
@@ -88,11 +85,7 @@ int main()
 		vm.run->io.size == 1 && vm.run->io.port == 0x3f8 &&
 		vm.run->io.count == 1) {
 		c = *(((char *)vm.run) + vm.run->io.data_offset);
-		printf("%02x", (unsigned char)c);
-		pcnt++;
-		if(pcnt%4 == 0) printf(" ");
-		    
-		if(pcnt%8 == 0) printf("\n");
+		printf("%c", c);
 	    }
 	    else {
 		print_regs(&vm);
@@ -294,7 +287,8 @@ int setup_vm_long_mode(struct vm *vm)
 }
 
 const char limit_file[] = "../elf-reader/limits.txt";
-const char executable[] = "../test/main";
+const char executable[] = "../boot/bin/main";
+const char bootfile[] = "../boot/main.bin";
 int setup_bootcode(struct vm *vm)
 {
     int ret, i, filesz;
