@@ -20,7 +20,7 @@
 	exit(1);							\
     } while(0)
 #define ONE_PAGE (0x1000)
-#define MAX_KERN_SIZE (16 * ONE_PAGE)
+#define MAX_KERN_SIZE (32 * ONE_PAGE)
 #define CODE_START (0x1000)
 #define STACK_START (0xA000)
 
