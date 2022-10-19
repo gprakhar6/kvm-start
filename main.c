@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <pthread.h>
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 
@@ -32,6 +33,7 @@ struct vm {
     int vcpufd;
     uint8_t *mem;
     unsigned int phy_mem_size;
+    pthread_t tid_tmr;
     struct kvm_run *run;
     struct kvm_sregs sregs;
     struct kvm_regs regs;
@@ -48,6 +50,7 @@ int setup_seg_real_mode(struct vm *vm);
 int setup_seg(struct vm *vm);
 int setup_bootcode(struct vm *vm);
 int setup_code(struct vm *vm);
+void setup_device_loop(struct vm *vm);
 int print_regs(struct vm *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 int main()
@@ -66,6 +69,7 @@ int main()
     //ts(t2);
     //printf("setuptime = %ld us\n", dt(t2,t1));
     setup_code(&vm);
+    setup_device_loop(&vm);
     ts(t1);
     while(1) {
 	ret = ioctl(vm.vcpufd, KVM_RUN, NULL);
@@ -110,6 +114,7 @@ finish:
 
     print_regs(&vm);
     printf("got halt?\n");
+    pthread_join(vm.tid_tmr, NULL);
     return 0;
 }
 
@@ -179,6 +184,8 @@ int get_vm(struct vm *vm)
 	fatal("cant get cpuid");
     
     //print_cpuid_output(cpuid2);
+    if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
+	fatal("Unable to create IRQCHIP\n");
     
     vm->vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, (unsigned long)0);
     if(vm->vcpufd == -1)
@@ -186,6 +193,8 @@ int get_vm(struct vm *vm)
 
     if(ioctl(vm->vcpufd, KVM_SET_CPUID2, cpuid2) < 0)
 	fatal("cannot set cpuid things\n");
+
+
     
     vm->run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
 		  MAP_SHARED, vm->vcpufd, 0);
@@ -357,6 +366,37 @@ int setup_code(struct vm *vm)
     
     fini_elf64_file(&elf);
     return 0;
+}
+
+void* timer_event_loop(void *vvm)
+{
+    struct kvm_irq_level irq;
+    struct vm *vm = vvm;
+    sleep(5);
+    printf("Inserting irq\n");
+    irq.irq = 0;
+    irq.level = 1;
+    if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
+	fatal("Unable to set irq line");
+    sleep(2);
+    printf("Inserting irq\n");
+    irq.irq = 0;
+    irq.level = 0;    
+    if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
+	fatal("Unable to set irq line");
+    sleep(2);
+    printf("Inserting irq\n");
+    irq.irq = 0;
+    irq.level = 1;    
+    if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
+	fatal("Unable to set irq line");        
+
+    return NULL;
+}
+void setup_device_loop(struct vm *vm)
+{
+    if(pthread_create(&vm->tid_tmr, NULL, timer_event_loop, vm))
+	fatal("Count create thread for timer\n");
 }
 
 void print_segment(struct kvm_segment *seg)
