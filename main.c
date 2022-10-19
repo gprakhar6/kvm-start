@@ -393,14 +393,14 @@ int print_regs(struct vm *vm)
     if(ret == -1)
 	fatal("cant get debug regs\n");    
     printf("--------------------------------\n");
-    printf("rip    = 0x%016llx\n", vm->regs.rip);
-    printf("rax    = 0x%016llx\n", vm->regs.rax);
+    printf("rip    = 0x%016llx\t", vm->regs.rip);
+    printf("rax    = 0x%016llx\t", vm->regs.rax);
     printf("rbx    = 0x%016llx\n", vm->regs.rbx);
-    printf("rcx    = 0x%016llx\n", vm->regs.rcx);
-    printf("rdx    = 0x%016llx\n", vm->regs.rdx);    
+    printf("rcx    = 0x%016llx\t", vm->regs.rcx);
+    printf("rdx    = 0x%016llx\t", vm->regs.rdx);    
     printf("rsp    = 0x%016llx\n", vm->regs.rsp);
-    printf("rbp    = 0x%016llx\n", vm->regs.rbp);
-    printf("rdi    = 0x%016llx\n", vm->regs.rdi);
+    printf("rbp    = 0x%016llx\t", vm->regs.rbp);
+    printf("rdi    = 0x%016llx\t", vm->regs.rdi);
     printf("rsi    = 0x%016llx\n", vm->regs.rsi);
 #define RECUR_CALL(x) printf("r[%02d]    = 0x%016llx\n", x, vm->regs.r ## x)
     RECUR_CALL(8);
@@ -413,16 +413,16 @@ int print_regs(struct vm *vm)
     RECUR_CALL(15);
 	
 	
-    printf("rflags = 0x%016llx\n", vm->regs.rflags);
-    printf("efer   = 0x%016llx\n", vm->sregs.efer);
+    printf("rflags = 0x%016llx\t", vm->regs.rflags);
+    printf("efer   = 0x%016llx\t", vm->sregs.efer);
     printf("cr0    = 0x%016llx\n", vm->sregs.cr0);
-    printf("cr2    = 0x%016llx\n", vm->sregs.cr2);
-    printf("cr3    = 0x%016llx\n", vm->sregs.cr3);        
+    printf("cr2    = 0x%016llx\t", vm->sregs.cr2);
+    printf("cr3    = 0x%016llx\t", vm->sregs.cr3);        
     printf("cr4    = 0x%016llx\n", vm->sregs.cr4);
     for(i = 0; i < 4; i++)
 	printf("db[%d]  = 0x%016llx\n", i, vm->dregs.db[i]);
-    printf("dr6    = 0x%016llx\n", vm->dregs.dr6);
-    printf("dr7    = 0x%016llx\n", vm->dregs.dr7);
+    printf("dr6    = 0x%016llx\t", vm->dregs.dr6);
+    printf("dr7    = 0x%016llx\t", vm->dregs.dr7);
     printf("flags  = 0x%016llx\n", vm->dregs.flags);
     print_segment(&vm->sregs.cs);
     printf("--------------------------------\n");    
