@@ -12,6 +12,8 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/eventfd.h>
+
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 
@@ -34,6 +36,7 @@ struct vm {
     uint8_t *mem;
     unsigned int phy_mem_size;
     pthread_t tid_tmr;
+    int tmr_eventfd;
     struct kvm_run *run;
     struct kvm_sregs sregs;
     struct kvm_regs regs;
@@ -50,6 +53,7 @@ int setup_seg_real_mode(struct vm *vm);
 int setup_seg(struct vm *vm);
 int setup_bootcode(struct vm *vm);
 int setup_code(struct vm *vm);
+void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(struct vm *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
@@ -69,6 +73,7 @@ int main()
     //ts(t2);
     //printf("setuptime = %ld us\n", dt(t2,t1));
     setup_code(&vm);
+    setup_irqfd(&vm, 1);
     setup_device_loop(&vm);
     ts(t1);
     while(1) {
@@ -372,27 +377,53 @@ void* timer_event_loop(void *vvm)
 {
     struct kvm_irq_level irq;
     struct vm *vm = vvm;
+    uint64_t u64;
+
+#if 1    
+    while(1) {
+	printf("Writing to irqfd\n");
+	u64 = 1;
+	write(vm->tmr_eventfd, &u64, sizeof(u64));
+	sleep(1);
+    }
+#endif    
+#if 0
     sleep(5);
     printf("Inserting irq\n");
-    irq.irq = 0;
+    irq.irq = 1;
     irq.level = 1;
     if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
 	fatal("Unable to set irq line");
     sleep(2);
     printf("Inserting irq\n");
-    irq.irq = 0;
+    irq.irq = 1;
     irq.level = 0;    
     if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
 	fatal("Unable to set irq line");
     sleep(2);
     printf("Inserting irq\n");
-    irq.irq = 0;
+    irq.irq = 1;
     irq.level = 1;    
     if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
 	fatal("Unable to set irq line");        
-
+#endif
     return NULL;
 }
+
+void setup_irqfd(struct vm *vm, uint32_t gsi)
+{
+    struct kvm_irqfd irqfd;
+    memset(&irqfd, 0, sizeof(irqfd));
+    if((irqfd.fd = eventfd(0, 0)) == -1)
+	fatal("Unable to set the eventfd\n");
+    irqfd.gsi = gsi;
+    
+    if(ioctl(vm->fd, KVM_IRQFD, &irqfd))
+	fatal("Unable to set the irqfd for the gsi = %d\n", gsi);
+    
+    vm->tmr_eventfd = irqfd.fd;
+}
+
 void setup_device_loop(struct vm *vm)
 {
     if(pthread_create(&vm->tid_tmr, NULL, timer_event_loop, vm))
