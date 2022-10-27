@@ -383,7 +383,7 @@ void* timer_event_loop(void *vvm)
     while(1) {
 	printf("Writing to irqfd\n");
 	u64 = 1;
-	write(vm->tmr_eventfd, &u64, sizeof(u64));
+	//write(vm->tmr_eventfd, &u64, sizeof(u64));
 	sleep(1);
     }
 #endif    
