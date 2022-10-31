@@ -401,28 +401,36 @@ int setup_code(struct vm *vm)
 void *create_usercode(void *vvm)
 {
     struct vm *vm = vvm;
-#if 0    
+
     int ret;
-    int i, sz;
+    int i, fsz, msz;
     void *saddr;
     Elf64_Addr daddr;
-    const char u_executable[] = "../faas_func/main.o";
+    const char u_object_file[] = "tmp/main.o";
+    const char u_executable[] = "tmp/main.elf";
+    char cmd[1024] = "bash create_executable.sh ";
     struct elf64_file elf;
-    if(ret == -1)
-	fatal("cant set regs\n");
+    
+    printf("Creating usercode\n");
+    strncat(cmd, u_object_file, sizeof(cmd)-1);
+    printf("executing cmd: %s\n",cmd);
+    if(system(cmd))
+	fatal("linking user code failed\n");
 
     init_limits(limit_file);
-    init_elf64_file(executable, &elf);
+    init_elf64_file(u_executable, &elf);
 
     for(i = 0; i < elf.num_regions; i++) {
 	daddr = elf.prog_regions[i]->vaddr;
 	saddr = elf.prog_regions[i]->addr;
-	sz = elf.prog_regions[i]->filesz;
-	memcpy(&vm->mem[daddr], saddr, sz);
+	fsz = elf.prog_regions[i]->filesz;
+	msz = elf.prog_regions[i]->memsz;
+	printf("%02d: %016lx %016lx %04d %04d\n", i, daddr, (uint64_t)saddr, fsz, msz);
+	//memcpy(&vm->mem[daddr], saddr, sz);
     }
-#endif
     printf("Completed user code creation\n");
-
+    fini_elf64_file(&elf);
+    exit(1);
     return NULL;
 }
 
