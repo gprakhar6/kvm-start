@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 
+#include "globvar.h"
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 
@@ -35,7 +36,7 @@ struct vm {
     int vcpufd;
     uint8_t *mem;
     unsigned int phy_mem_size;
-    pthread_t tid_tmr;
+    pthread_t tid_tmr, tid_ucc;
     int tmr_eventfd;
     struct kvm_run *run;
     struct kvm_sregs sregs;
@@ -45,6 +46,7 @@ struct vm {
 
 struct timeval t1, t2;
 
+static inline void handle_io_port(struct vm *vm);
 int get_vm(struct vm *vm);
 int get_regs_sregs(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
@@ -53,6 +55,7 @@ int setup_seg_real_mode(struct vm *vm);
 int setup_seg(struct vm *vm);
 int setup_bootcode(struct vm *vm);
 int setup_code(struct vm *vm);
+int setup_usercode(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(struct vm *vm);
@@ -61,7 +64,6 @@ int main()
 {
     int ret;
     struct vm vm;
-    char c;
     
     ts(t1);
     get_vm(&vm);
@@ -74,7 +76,8 @@ int main()
     //printf("setuptime = %ld us\n", dt(t2,t1));
     setup_code(&vm);
     setup_irqfd(&vm, 1);
-    setup_device_loop(&vm);
+    setup_device_loop(&vm); // start device thread
+    setup_usercode(&vm); // start user code create thread
     ts(t1);
     while(1) {
 	ret = ioctl(vm.vcpufd, KVM_RUN, NULL);
@@ -90,16 +93,7 @@ int main()
 	    goto finish;
 	    break;
 	case KVM_EXIT_IO:
-	    if (vm.run->io.direction == KVM_EXIT_IO_OUT &&
-		vm.run->io.size == 1 && vm.run->io.port == 0x3f8 &&
-		vm.run->io.count == 1) {
-		c = *(((char *)vm.run) + vm.run->io.data_offset);
-		printf("%c", c);
-	    }
-	    else {
-		print_regs(&vm);
-		fatal("unhandled KVM_EXIT_IO, %X\n", vm.run->io.port);
-	    }
+	    handle_io_port(&vm);
 	    break;	    
 	case KVM_EXIT_SHUTDOWN:
 	    fatal("KVM_EXIT_SHUTDOWN\n");
@@ -121,6 +115,37 @@ finish:
     printf("got halt?\n");
     pthread_join(vm.tid_tmr, NULL);
     return 0;
+}
+
+void handle_io_port(struct vm *vm)
+{
+    char c;
+    switch(vm->run->io.port) {
+    case PORT_SERIAL: /* for the printf function */
+	if (vm->run->io.direction == KVM_EXIT_IO_OUT &&
+	    vm->run->io.size == 1 && vm->run->io.count == 1) {
+	    c = *(((char *)vm->run) + vm->run->io.data_offset);
+	    printf("%c", c);
+	}
+	break;
+    case PORT_WAIT_USER_CODE_MAPPING: /* For waiting for user code creation thread */
+	pthread_join(vm->tid_ucc, NULL);
+	printf("Joined\n");
+	break;
+    case PORT_HLT:
+	printf("Halt port IO\n");
+	print_regs(vm);
+	exit(0);
+	break;
+    case PORT_PRINT_REGS:
+	printf("PORT_PRINT_REGS IO:\n");
+	print_regs(vm);
+	break;
+    default:
+	print_regs(vm);
+	fatal("unhandled KVM_EXIT_IO, %X\n", vm->run->io.port);
+	break;
+    }    
 }
 
 int setup_guest_phy2_host_virt_map(struct vm *vm)
@@ -371,6 +396,41 @@ int setup_code(struct vm *vm)
     
     fini_elf64_file(&elf);
     return 0;
+}
+
+void *create_usercode(void *vvm)
+{
+    struct vm *vm = vvm;
+#if 0    
+    int ret;
+    int i, sz;
+    void *saddr;
+    Elf64_Addr daddr;
+    const char u_executable[] = "../faas_func/main.o";
+    struct elf64_file elf;
+    if(ret == -1)
+	fatal("cant set regs\n");
+
+    init_limits(limit_file);
+    init_elf64_file(executable, &elf);
+
+    for(i = 0; i < elf.num_regions; i++) {
+	daddr = elf.prog_regions[i]->vaddr;
+	saddr = elf.prog_regions[i]->addr;
+	sz = elf.prog_regions[i]->filesz;
+	memcpy(&vm->mem[daddr], saddr, sz);
+    }
+#endif
+    printf("Completed user code creation\n");
+
+    return NULL;
+}
+
+int setup_usercode(struct vm *vm)
+{
+    // tid_ucc : tid user code create
+    if(pthread_create(&vm->tid_ucc, NULL, create_usercode, vm))
+	fatal("Couldnt create thread for user code creation\n");    
 }
 
 void* timer_event_loop(void *vvm)

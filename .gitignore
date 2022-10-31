@@ -2,3 +2,4 @@
 main
 perf*
 *.swp
+tmp/*
