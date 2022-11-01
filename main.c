@@ -225,10 +225,11 @@ void *create_vcpu(void *vvcpu)
 	ret = ioctl(vcpu->vcpufd, KVM_SET_REGS, &regs);
 	if(ret == -1)
 	    fatal("Cannot set regs in vcpu thread");
+
+	printf("entry = %lx, stack_start = %lx\n", vcpu->entry, vcpu->stack_start);
     }
 
     printf("before run vcpu %ld\n", vcpu->tid);
-    while(1);
     while(1) {
 	ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
 	if(ret == -1)
@@ -244,6 +245,7 @@ void *create_vcpu(void *vvcpu)
 	    handle_io_port(vcpu);
 	    break;	    
 	case KVM_EXIT_SHUTDOWN:
+	    print_regs(vcpu);
 	    fatal("KVM_EXIT_SHUTDOWN\n");
 	    break;
 	case KVM_EXIT_INTERNAL_ERROR:
