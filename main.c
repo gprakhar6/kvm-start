@@ -40,7 +40,7 @@ typedef struct
     struct kvm_regs regs;
     struct kvm_debugregs dregs;
     uint64_t entry;
-    uint64_t stack_start;    
+    uint64_t stack_start;
 } t_vcpu;
 
 struct vm {
@@ -48,7 +48,7 @@ struct vm {
     int ncpu;
     t_vcpu *vcpu;
     uint64_t entry;
-    uint64_t stack_start;    
+    uint64_t stack_start;
     struct kvm_cpuid2 *cpuid2;
     int mmap_size;
     uint8_t *mem;
@@ -75,22 +75,22 @@ int main()
 {
     int i, ret;
     struct vm vm;
-    
+
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);
     setup_bootcode(&vm);
     vm.ncpu = 2;
-    setup_vcpus(&vm);    
-    setup_irqfd(&vm, 1);
+    setup_vcpus(&vm);
+    //setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
-    setup_usercode(&vm); // start user code create thread
+    //setup_usercode(&vm); // start user code create thread
 
     pthread_join(vm.tid_tmr, NULL);
     printf("Timer thread joined\n");
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
     printf("All cpu thread joined\n");
-    
+
     return 0;
 }
 
@@ -122,7 +122,7 @@ static inline void handle_io_port(t_vcpu *vcpu)
 	print_regs(vcpu);
 	fatal("unhandled KVM_EXIT_IO, %X\n", vcpu->run->io.port);
 	break;
-    }    
+    }
 }
 
 int setup_guest_phy2_host_virt_map(struct vm *vm)
@@ -144,7 +144,7 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
 	    .guest_phys_addr = 0,
 	    .memory_size = vm->phy_mem_size,
 	    .userspace_addr = (size_t) vm->mem
-	};    
+	};
 	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
 	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)");
 	}
@@ -157,7 +157,7 @@ int get_vm(struct vm *vm)
 {
     int kvm, ret;
     int err, nent;
-    
+
     err = 0;
     kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if(kvm == -1) {
@@ -172,7 +172,7 @@ int get_vm(struct vm *vm)
     vm->fd = ioctl(kvm, KVM_CREATE_VM, (unsigned long)0);
     if(vm->fd == -1)
 	fatal("cant create VM\n");
-    
+
     ret = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, NULL);
     if(ret == -1)
 	fatal("kvm mmap size error\n");
@@ -191,8 +191,8 @@ int get_vm(struct vm *vm)
 
     // all future vcpus will now have irqchip
     //print_cpuid_output(vm->cpuid2);
-    if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
-	fatal("Unable to create IRQCHIP\n");
+//    if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
+//	fatal("Unable to create IRQCHIP\n");
 
     // not sure about its correctness
     ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
@@ -204,9 +204,12 @@ void *create_vcpu(void *vvcpu)
 {
     t_vcpu *vcpu = vvcpu;
     int ret;
-    
+
     printf("In vcpu thread %ld\n", vcpu->tid);
     // to get the real mode running
+    if(ioctl(vcpu->vcpufd, KVM_GET_SREGS, &(vcpu->sregs)) < 0)
+	fatal("cant set get sregs tid = %ld\n", vcpu->tid);
+
     vcpu->sregs.cs.base = 0;
     vcpu->sregs.cs.selector = 0;
     if(ioctl(vcpu->vcpufd, KVM_SET_SREGS, &(vcpu->sregs)) < 0)
@@ -221,7 +224,7 @@ void *create_vcpu(void *vvcpu)
 	    .rdi = vcpu->stack_start,
 	    .rsi = 0,
 	    .rflags = 0x2
-	};    
+	};
 	ret = ioctl(vcpu->vcpufd, KVM_SET_REGS, &regs);
 	if(ret == -1)
 	    fatal("Cannot set regs in vcpu thread");
@@ -236,14 +239,14 @@ void *create_vcpu(void *vvcpu)
 	    fatal("KVM_RUN ERROR\n");
 
 	//printf("exit reason = %d\n", vm.run->exit_reason);
-	//print_regs(&vm);	
+	//print_regs(&vm);
 	switch(vcpu->run->exit_reason) {
 	case KVM_EXIT_HLT:
 	    goto finish;
 	    break;
 	case KVM_EXIT_IO:
 	    handle_io_port(vcpu);
-	    break;	    
+	    break;
 	case KVM_EXIT_SHUTDOWN:
 	    print_regs(vcpu);
 	    fatal("KVM_EXIT_SHUTDOWN\n");
@@ -255,7 +258,7 @@ void *create_vcpu(void *vvcpu)
 	    fatal("KVM_EXIT_FAIL_ENTRY\n");
 	    break;
 	default:
-	    break;   
+	    break;
 	}
     }
 
@@ -270,24 +273,24 @@ void setup_vcpus(struct vm *vm)
     vm->vcpu = calloc(vm->ncpu, sizeof(*(vm->vcpu)));
     if(vm->vcpu == NULL)
 	fatal("Cannot allocate vm->vcpu");
-    
+
     for(i = 0; i < vm->ncpu; i++) {
 	vcpu_id = i;
 	vm->vcpu[i].vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, vcpu_id);
 	printf("vcpufd = %d\n", vm->vcpu[i].vcpufd);
 	if(vm->vcpu[i].vcpufd == -1)
 	    fatal("Cannot create vcpu\n");
-	
+
 	if(ioctl(vm->vcpu[i].vcpufd, KVM_SET_CPUID2, vm->cpuid2) < 0)
 	    fatal("cannot set cpuid things\n");
-	
+
 	vm->vcpu[i].run = mmap(NULL, vm->mmap_size, PROT_READ | PROT_WRITE,
 			       MAP_SHARED, vm->vcpu[i].vcpufd, 0);
 	if(!vm->vcpu[i].run)
 	    fatal("run error\n");
 
 	vm->vcpu[i].entry = vm->entry;
-	vm->vcpu[i].stack_start = vm->stack_start;
+	vm->vcpu[i].stack_start = vm->stack_start + i * 0x4000;
     }
 
     // start all the vcpu threads
@@ -332,7 +335,7 @@ int setup_bootcode(struct vm *vm)
     // tell all cpu code is ready and mapped
     for(i = 0; i < vm->ncpu; i++)
 	sem_post(&vcpu_init_barrier);
-    
+
     return 0;
 }
 
@@ -346,7 +349,7 @@ int setup_usercode(struct vm *vm)
     const char u_executable[] = "tmp/main.elf";
     char cmd[1024] = "bash create_executable.sh ";
     struct elf64_file elf;
-    
+
     printf("Creating usercode\n");
     strncat(cmd, u_object_file, sizeof(cmd)-1);
     printf("executing cmd: %s\n",cmd);
@@ -374,14 +377,14 @@ void* timer_event_loop(void *vvm)
     struct vm *vm = vvm;
     uint64_t u64;
 
-#if 1    
+#if 0
     while(1) {
 	printf("Writing to irqfd\n");
 	u64 = 1;
 	//write(vm->tmr_eventfd, &u64, sizeof(u64));
 	sleep(1);
     }
-#endif    
+#endif
 #if 0
     sleep(5);
     printf("Inserting irq\n");
@@ -392,15 +395,15 @@ void* timer_event_loop(void *vvm)
     sleep(2);
     printf("Inserting irq\n");
     irq.irq = 1;
-    irq.level = 0;    
+    irq.level = 0;
     if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
 	fatal("Unable to set irq line");
     sleep(2);
     printf("Inserting irq\n");
     irq.irq = 1;
-    irq.level = 1;    
+    irq.level = 1;
     if(ioctl(vm->fd, KVM_IRQ_LINE, &irq))
-	fatal("Unable to set irq line");        
+	fatal("Unable to set irq line");
 #endif
     return NULL;
 }
@@ -414,10 +417,10 @@ void setup_irqfd(struct vm *vm, uint32_t gsi)
     if((irqfd.fd = eventfd(0, 0)) == -1)
 	fatal("Unable to set the eventfd\n");
     irqfd.gsi = gsi;
-    
+
     if(ioctl(vm->fd, KVM_IRQFD, &irqfd))
 	fatal("Unable to set the irqfd for the gsi = %d\n", gsi);
-    
+
     vm->tmr_eventfd = irqfd.fd;
 }
 
@@ -450,7 +453,7 @@ void print_cpuid_output(struct kvm_cpuid2 *cpuid2)
 int print_regs(t_vcpu *vcpu)
 {
     int ret, i;
-    
+
     ret = ioctl(vcpu->vcpufd, KVM_GET_REGS, &vcpu->regs);
     if(ret == -1)
 	fatal("cant get regs\n");
@@ -459,13 +462,13 @@ int print_regs(t_vcpu *vcpu)
 	fatal("cant get regs\n");
     ret = ioctl(vcpu->vcpufd, KVM_GET_DEBUGREGS, &vcpu->dregs);
     if(ret == -1)
-	fatal("cant get debug regs\n");    
+	fatal("cant get debug regs\n");
     printf("--------------------------------\n");
     printf("rip    = 0x%016llx\t", vcpu->regs.rip);
     printf("rax    = 0x%016llx\t", vcpu->regs.rax);
     printf("rbx    = 0x%016llx\n", vcpu->regs.rbx);
     printf("rcx    = 0x%016llx\t", vcpu->regs.rcx);
-    printf("rdx    = 0x%016llx\t", vcpu->regs.rdx);    
+    printf("rdx    = 0x%016llx\t", vcpu->regs.rdx);
     printf("rsp    = 0x%016llx\n", vcpu->regs.rsp);
     printf("rbp    = 0x%016llx\t", vcpu->regs.rbp);
     printf("rdi    = 0x%016llx\t", vcpu->regs.rdi);
@@ -479,13 +482,13 @@ int print_regs(t_vcpu *vcpu)
     RECUR_CALL(13);
     RECUR_CALL(14);
     RECUR_CALL(15);
-	
-	
+
+
     printf("rflags = 0x%016llx\t", vcpu->regs.rflags);
     printf("efer   = 0x%016llx\t", vcpu->sregs.efer);
     printf("cr0    = 0x%016llx\n", vcpu->sregs.cr0);
     printf("cr2    = 0x%016llx\t", vcpu->sregs.cr2);
-    printf("cr3    = 0x%016llx\t", vcpu->sregs.cr3);        
+    printf("cr3    = 0x%016llx\t", vcpu->sregs.cr3);
     printf("cr4    = 0x%016llx\n", vcpu->sregs.cr4);
     for(i = 0; i < 4; i++)
 	printf("db[%d]  = 0x%016llx\n", i, vcpu->dregs.db[i]);
@@ -493,5 +496,5 @@ int print_regs(t_vcpu *vcpu)
     printf("dr7    = 0x%016llx\t", vcpu->dregs.dr7);
     printf("flags  = 0x%016llx\n", vcpu->dregs.flags);
     print_segment(&vcpu->sregs.cs);
-    printf("--------------------------------\n");    
+    printf("--------------------------------\n");
 }
