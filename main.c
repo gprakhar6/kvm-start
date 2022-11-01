@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sys/eventfd.h>
+#include <semaphore.h>
 
 #include "globvar.h"
 #include "bits.h"
@@ -24,126 +25,102 @@
 	exit(1);							\
     } while(0)
 #define ONE_PAGE (0x1000)
-#define MAX_KERN_SIZE (1024 * ONE_PAGE) // 4MB
 #define CODE_START (0x1000)
 #define STACK_START (0xA000)
 
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
 
-struct vm {
-    int fd;
+typedef struct
+{
     int vcpufd;
-    uint8_t *mem;
-    unsigned int phy_mem_size;
-    pthread_t tid_tmr, tid_ucc;
-    int tmr_eventfd;
+    pthread_t tid;
     struct kvm_run *run;
     struct kvm_sregs sregs;
     struct kvm_regs regs;
     struct kvm_debugregs dregs;
+    uint64_t entry;
+    uint64_t stack_start;    
+} t_vcpu;
+
+struct vm {
+    int fd;
+    int ncpu;
+    t_vcpu *vcpu;
+    uint64_t entry;
+    uint64_t stack_start;    
+    struct kvm_cpuid2 *cpuid2;
+    int mmap_size;
+    uint8_t *mem;
+    unsigned int phy_mem_size;
+    pthread_t tid_tmr, tid_ucc;
+    int tmr_eventfd;
 };
 
 struct timeval t1, t2;
+sem_t vcpu_init_barrier;
 
-static inline void handle_io_port(struct vm *vm);
+static inline void handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
-int get_regs_sregs(struct vm *vm);
+void setup_vcpus(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
-int setup_vm_long_mode(struct vm *vm);
-int setup_seg_real_mode(struct vm *vm);
-int setup_seg(struct vm *vm);
 int setup_bootcode(struct vm *vm);
-int setup_code(struct vm *vm);
 int setup_usercode(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
-int print_regs(struct vm *vm);
+int print_regs(t_vcpu *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
+
 int main()
 {
-    int ret;
+    int i, ret;
     struct vm vm;
     
-    ts(t1);
     get_vm(&vm);
-    setup_guest_phy2_host_virt_map(&vm);    
-    get_regs_sregs(&vm);
-    setup_seg_real_mode(&vm);    
-    //setup_bootcode(&vm);
-    //setup_vm_long_mode(&vm);
-    //ts(t2);
-    //printf("setuptime = %ld us\n", dt(t2,t1));
-    setup_code(&vm);
+    setup_guest_phy2_host_virt_map(&vm);
+    setup_bootcode(&vm);
+    vm.ncpu = 2;
+    setup_vcpus(&vm);    
     setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
     setup_usercode(&vm); // start user code create thread
-    ts(t1);
-    while(1) {
-	ret = ioctl(vm.vcpufd, KVM_RUN, NULL);
-	if(ret == -1)
-	    fatal("KVM_RUN ERROR\n");
 
-	//printf("exit reason = %d\n", vm.run->exit_reason);
-	//print_regs(&vm);	
-	switch(vm.run->exit_reason) {
-	case KVM_EXIT_HLT:
-	    ts(t2);
-	    printf("time = %ld\n", dt(t2, t1));
-	    goto finish;
-	    break;
-	case KVM_EXIT_IO:
-	    handle_io_port(&vm);
-	    break;	    
-	case KVM_EXIT_SHUTDOWN:
-	    fatal("KVM_EXIT_SHUTDOWN\n");
-	    break;
-	case KVM_EXIT_INTERNAL_ERROR:
-	    fatal("KVM_EXIT_INTERNAL_ERROR\n");
-	    break;
-	case KVM_EXIT_FAIL_ENTRY:
-	    fatal("KVM_EXIT_FAIL_ENTRY\n");
-	    break;
-	default:
-	    break;   
-	}
-    }
-
-finish:
-
-    print_regs(&vm);
-    printf("got halt?\n");
     pthread_join(vm.tid_tmr, NULL);
+    printf("Timer thread joined\n");
+    for(i = 0; i < vm.ncpu; i++)
+	pthread_join(vm.vcpu[i].tid, NULL);
+    printf("All cpu thread joined\n");
+    
     return 0;
 }
 
-void handle_io_port(struct vm *vm)
+static inline void handle_io_port(t_vcpu *vcpu)
 {
     char c;
-    switch(vm->run->io.port) {
+    switch(vcpu->run->io.port) {
     case PORT_SERIAL: /* for the printf function */
-	if (vm->run->io.direction == KVM_EXIT_IO_OUT &&
-	    vm->run->io.size == 1 && vm->run->io.count == 1) {
-	    c = *(((char *)vm->run) + vm->run->io.data_offset);
+	if (vcpu->run->io.direction == KVM_EXIT_IO_OUT &&
+	    vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
+	    c = *(((char *)vcpu->run) + vcpu->run->io.data_offset);
 	    printf("%c", c);
 	}
 	break;
     case PORT_WAIT_USER_CODE_MAPPING: /* For waiting for user code creation thread */
-	pthread_join(vm->tid_ucc, NULL);
+	sem_wait(&vcpu_init_barrier);
 	printf("Joined\n");
 	break;
     case PORT_HLT:
 	printf("Halt port IO\n");
-	print_regs(vm);
+	print_regs(vcpu);
 	exit(0);
 	break;
     case PORT_PRINT_REGS:
 	printf("PORT_PRINT_REGS IO:\n");
-	print_regs(vm);
+	print_regs(vcpu);
 	break;
     default:
-	print_regs(vm);
-	fatal("unhandled KVM_EXIT_IO, %X\n", vm->run->io.port);
+	print_regs(vcpu);
+	fatal("unhandled KVM_EXIT_IO, %X\n", vcpu->run->io.port);
 	break;
     }    
 }
@@ -178,9 +155,8 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
 
 int get_vm(struct vm *vm)
 {
-    int kvm, ret, mmap_size;
+    int kvm, ret;
     int err, nent;
-    struct kvm_cpuid2 *cpuid2;
     
     err = 0;
     kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
@@ -200,176 +176,142 @@ int get_vm(struct vm *vm)
     ret = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, NULL);
     if(ret == -1)
 	fatal("kvm mmap size error\n");
-    mmap_size = ret;
-    if(mmap_size < sizeof(*vm->run))
+    vm->mmap_size = ret;
+    if(vm->mmap_size < sizeof(struct kvm_run))
 	fatal("really! mmap_size < run. Why?\n");
 
     nent = 128;
-    cpuid2 =
+    vm->cpuid2 =
 	(struct kvm_cpuid2 *)
 	malloc(sizeof(struct kvm_cpuid2)
 	       + nent * sizeof(struct kvm_cpuid_entry2));
-    cpuid2->nent = nent;
-    if(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, cpuid2) < 0)
+    vm->cpuid2->nent = nent;
+    if(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, vm->cpuid2) < 0)
 	fatal("cant get cpuid");
-    
-    //print_cpuid_output(cpuid2);
+
+    // all future vcpus will now have irqchip
+    //print_cpuid_output(vm->cpuid2);
     if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
 	fatal("Unable to create IRQCHIP\n");
-    
-    vm->vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, (unsigned long)0);
-    if(vm->vcpufd == -1)
-	fatal("Cannot create vcpu\n");
 
-    if(ioctl(vm->vcpufd, KVM_SET_CPUID2, cpuid2) < 0)
-	fatal("cannot set cpuid things\n");
-
-
-    
-    vm->run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
-		  MAP_SHARED, vm->vcpufd, 0);
-    if(!vm->run)
-	fatal("run error\n");
-
+    // not sure about its correctness
+    ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
+    printf("nr_vcpus = %d\n", ret);
     return err;
 }
 
-int get_regs_sregs(struct vm *vm)
+void *create_vcpu(void *vvcpu)
 {
+    t_vcpu *vcpu = vvcpu;
     int ret;
-    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
-    if(ret == -1)
-	fatal("Cant get sregs\n");
     
-    ret = ioctl(vm->vcpufd, KVM_GET_REGS, &vm->regs);
-    if(ret == -1)
-	fatal("cant get regs\n");;
-    return ret;
+    printf("In vcpu thread %ld\n", vcpu->tid);
+    // to get the real mode running
+    vcpu->sregs.cs.base = 0;
+    vcpu->sregs.cs.selector = 0;
+    if(ioctl(vcpu->vcpufd, KVM_SET_SREGS, &(vcpu->sregs)) < 0)
+	fatal("cant set seg sregs tid = %ld\n", vcpu->tid);
+
+    {
+	struct kvm_regs regs = {
+	    .rip = vcpu->entry,
+	    .rax = 2,
+	    .rbx = 2,
+	    .rsp = vcpu->stack_start, /* temporary stack */
+	    .rdi = vcpu->stack_start,
+	    .rsi = 0,
+	    .rflags = 0x2
+	};    
+	ret = ioctl(vcpu->vcpufd, KVM_SET_REGS, &regs);
+	if(ret == -1)
+	    fatal("Cannot set regs in vcpu thread");
+    }
+
+    printf("before run vcpu %ld\n", vcpu->tid);
+    while(1);
+    while(1) {
+	ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
+	if(ret == -1)
+	    fatal("KVM_RUN ERROR\n");
+
+	//printf("exit reason = %d\n", vm.run->exit_reason);
+	//print_regs(&vm);	
+	switch(vcpu->run->exit_reason) {
+	case KVM_EXIT_HLT:
+	    goto finish;
+	    break;
+	case KVM_EXIT_IO:
+	    handle_io_port(vcpu);
+	    break;	    
+	case KVM_EXIT_SHUTDOWN:
+	    fatal("KVM_EXIT_SHUTDOWN\n");
+	    break;
+	case KVM_EXIT_INTERNAL_ERROR:
+	    fatal("KVM_EXIT_INTERNAL_ERROR\n");
+	    break;
+	case KVM_EXIT_FAIL_ENTRY:
+	    fatal("KVM_EXIT_FAIL_ENTRY\n");
+	    break;
+	default:
+	    break;   
+	}
+    }
+
+finish:
+    print_regs(vcpu);
 }
 
-void setup_paging(struct vm *vm)
+void setup_vcpus(struct vm *vm)
 {
-    uint64_t pml4_addr = MAX_KERN_SIZE;
-    uint64_t *pml4 = (void*) (vm->mem + pml4_addr);
+    int i;
+    unsigned long vcpu_id;
+    vm->vcpu = calloc(vm->ncpu, sizeof(*(vm->vcpu)));
+    if(vm->vcpu == NULL)
+	fatal("Cannot allocate vm->vcpu");
     
-    uint64_t pdp_addr = pml4_addr + 0x1000;
-    uint64_t *pdp = (void*) (vm->mem + pdp_addr);
-    
-    uint64_t pd_addr = pdp_addr + 0x1000;
-    uint64_t *pd = (void*) (vm->mem + pd_addr);
-    int ret;
-    
-//    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
-//    if(ret == -1)
-//	fatal("Cant get sregs\n");
-    
-    pml4[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pdp_addr;
-    pdp[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pd_addr;
-    /* kernel only, no PED64_USER */
-    pd[0] = PDE64_PRESENT | PDE64_RW | PDE64_PS;
-    
-    vm->sregs.cr3 = pml4_addr;
-    vm->sregs.cr4 = CR4_PAE;
-    vm->sregs.cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT; /* enable SSE instruction */
-    vm->sregs.cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | \
-	CR0_AM | CR0_PG;
-    vm->sregs.efer = EFER_LME | EFER_LMA;
-    vm->sregs.efer |= EFER_SCE; /* enable syscall instruction */
-    if(ioctl(vm->vcpufd, KVM_SET_SREGS, &vm->sregs) < 0)
-	fatal("cant set sregs\n");
-    
-}
-int setup_seg_real_mode(struct vm *vm)
-{
-    int ret;
-    vm->sregs.cs.base = 0;
-    //vm->sregs.cs.limit = 0xffffffff;    
-    vm->sregs.cs.selector = 0;
-    if(ioctl(vm->vcpufd, KVM_SET_SREGS, &vm->sregs) < 0)
-	fatal("cant set seg sregs");
-}
+    for(i = 0; i < vm->ncpu; i++) {
+	vcpu_id = i;
+	vm->vcpu[i].vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, vcpu_id);
+	printf("vcpufd = %d\n", vm->vcpu[i].vcpufd);
+	if(vm->vcpu[i].vcpufd == -1)
+	    fatal("Cannot create vcpu\n");
+	
+	if(ioctl(vm->vcpu[i].vcpufd, KVM_SET_CPUID2, vm->cpuid2) < 0)
+	    fatal("cannot set cpuid things\n");
+	
+	vm->vcpu[i].run = mmap(NULL, vm->mmap_size, PROT_READ | PROT_WRITE,
+			       MAP_SHARED, vm->vcpu[i].vcpufd, 0);
+	if(!vm->vcpu[i].run)
+	    fatal("run error\n");
 
-int setup_seg(struct vm *vm)
-{
-    int ret;
-    struct kvm_segment seg = {
-	.base = 0,
-	.limit = 0xffffffff,
-	.selector = 1 << 3,
-	.present = 1,
-	.type = 0xb, /* Code segment */
-	.dpl = 0, /* Kernel: level 0 */
-	.db = 0,
-	.s = 1,
-	.l = 1, /* long mode */
-	.g = 1
-    };
-//    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
-//    if(ret == -1)
-//	fatal("Cant get sregs\n");    
-    vm->sregs.cs = seg;
-    seg.type = 0x3; /* Data segment */
-    seg.selector = 2 << 3;
-    vm->sregs.ds = vm->sregs.es = vm->sregs.fs = \
-	vm->sregs.gs = vm->sregs.ss = seg;
-    if(ioctl(vm->vcpufd, KVM_SET_SREGS, &vm->sregs) < 0)
-	fatal("cant set seg sregs");
-}
+	vm->vcpu[i].entry = vm->entry;
+	vm->vcpu[i].stack_start = vm->stack_start;
+    }
 
-int setup_vm_long_mode(struct vm *vm)
-{
-    int ret;
-
-    setup_paging(vm);
-    setup_seg(vm);
-    
+    // start all the vcpu threads
+    for(i = 0; i < vm->ncpu; i++) {
+	vm->vcpu[i].tid = -1;
+	if(pthread_create(&(vm->vcpu[i].tid), NULL, create_vcpu, &(vm->vcpu[i]))) {
+	    fatal("Couldnt create thread for user code creation\n");
+	}
+	else {
+	    printf("Created vcpu thread with tid  = %ld\n", vm->vcpu[i].tid);
+	}
+    }
 }
 
 const char limit_file[] = "../elf-reader/limits.txt";
 const char executable[] = "../boot/bin/main";
-const char bootfile[] = "../boot/main.bin";
 int setup_bootcode(struct vm *vm)
-{
-    int ret, i, filesz;
-    FILE *fp;
-
-    fp = fopen(bootfile, "r");
-    if(fp == NULL)
-	fatal("cant open %s\n", bootfile);
-
-    fseek(fp, 0, SEEK_END);
-    filesz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if(fread(&vm->mem[0x1000], filesz, 1, fp) != 1)
-	fatal("cant read %s file\n", bootfile);
-    {
-	struct kvm_regs regs = {
-	    .rip = 0x1000,
-	    .rax = 2,
-	    .rbx = 2,
-	    .rsp = STACK_START, /* temporary stack */
-	    .rbp = STACK_START,
-	    .rdi = 0,
-	    .rsi = 0,	    
-	    .rflags = 0x2
-	};    
-	ret = ioctl(vm->vcpufd, KVM_SET_REGS, &regs);
-	if(ret == -1)
-	    fatal("cant set regs\n");
-    }    
-}
-
-int setup_code(struct vm *vm)
 {
     int ret;
     int i, sz;
     void *saddr;
     Elf64_Addr daddr;
-    
     struct elf64_file elf;
-    if(ret == -1)
-	fatal("cant set regs\n");
+
+    // to make all vcpu wait at barrier
+    sem_init(&vcpu_init_barrier, 0, 0);
 
     init_limits(limit_file);
     init_elf64_file(executable, &elf);
@@ -380,28 +322,20 @@ int setup_code(struct vm *vm)
 	sz = elf.prog_regions[i]->filesz;
 	memcpy(&vm->mem[daddr], saddr, sz);
     }
-    
-    {
-	struct kvm_regs regs = {
-	    .rip = elf.ehdr.e_entry,
-	    .rax = 2,
-	    .rbx = 2,
-	    .rsp = STACK_START, /* temporary stack */
-	    .rdi = STACK_START,
-	    .rsi = 0,
-	    .rflags = 0x2
-	};    
-	ret = ioctl(vm->vcpufd, KVM_SET_REGS, &regs);
-    }
-    
+
+    vm->entry = elf.ehdr.e_entry;
+    vm->stack_start = STACK_START; // TBD get from elf
     fini_elf64_file(&elf);
+
+    // tell all cpu code is ready and mapped
+    for(i = 0; i < vm->ncpu; i++)
+	sem_post(&vcpu_init_barrier);
+    
     return 0;
 }
 
-void *create_usercode(void *vvm)
+int setup_usercode(struct vm *vm)
 {
-    struct vm *vm = vvm;
-
     int ret;
     int i, fsz, msz;
     void *saddr;
@@ -430,15 +364,6 @@ void *create_usercode(void *vvm)
     }
     printf("Completed user code creation\n");
     fini_elf64_file(&elf);
-    exit(1);
-    return NULL;
-}
-
-int setup_usercode(struct vm *vm)
-{
-    // tid_ucc : tid user code create
-    if(pthread_create(&vm->tid_ucc, NULL, create_usercode, vm))
-	fatal("Couldnt create thread for user code creation\n");    
 }
 
 void* timer_event_loop(void *vvm)
@@ -478,6 +403,8 @@ void* timer_event_loop(void *vvm)
     return NULL;
 }
 
+// to send interrupt from host to guest
+// irqfd is a lazy sort of mechanism
 void setup_irqfd(struct vm *vm, uint32_t gsi)
 {
     struct kvm_irqfd irqfd;
@@ -518,30 +445,30 @@ void print_cpuid_output(struct kvm_cpuid2 *cpuid2)
 	printf("edx         = 0x%08x\n", cpuid2->entries[i].edx     );
     }
 }
-int print_regs(struct vm *vm)
+int print_regs(t_vcpu *vcpu)
 {
     int ret, i;
     
-    ret = ioctl(vm->vcpufd, KVM_GET_REGS, &vm->regs);
+    ret = ioctl(vcpu->vcpufd, KVM_GET_REGS, &vcpu->regs);
     if(ret == -1)
 	fatal("cant get regs\n");
-    ret = ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs);
+    ret = ioctl(vcpu->vcpufd, KVM_GET_SREGS, &vcpu->sregs);
     if(ret == -1)
 	fatal("cant get regs\n");
-    ret = ioctl(vm->vcpufd, KVM_GET_DEBUGREGS, &vm->dregs);
+    ret = ioctl(vcpu->vcpufd, KVM_GET_DEBUGREGS, &vcpu->dregs);
     if(ret == -1)
 	fatal("cant get debug regs\n");    
     printf("--------------------------------\n");
-    printf("rip    = 0x%016llx\t", vm->regs.rip);
-    printf("rax    = 0x%016llx\t", vm->regs.rax);
-    printf("rbx    = 0x%016llx\n", vm->regs.rbx);
-    printf("rcx    = 0x%016llx\t", vm->regs.rcx);
-    printf("rdx    = 0x%016llx\t", vm->regs.rdx);    
-    printf("rsp    = 0x%016llx\n", vm->regs.rsp);
-    printf("rbp    = 0x%016llx\t", vm->regs.rbp);
-    printf("rdi    = 0x%016llx\t", vm->regs.rdi);
-    printf("rsi    = 0x%016llx\n", vm->regs.rsi);
-#define RECUR_CALL(x) printf("r[%02d]    = 0x%016llx\n", x, vm->regs.r ## x)
+    printf("rip    = 0x%016llx\t", vcpu->regs.rip);
+    printf("rax    = 0x%016llx\t", vcpu->regs.rax);
+    printf("rbx    = 0x%016llx\n", vcpu->regs.rbx);
+    printf("rcx    = 0x%016llx\t", vcpu->regs.rcx);
+    printf("rdx    = 0x%016llx\t", vcpu->regs.rdx);    
+    printf("rsp    = 0x%016llx\n", vcpu->regs.rsp);
+    printf("rbp    = 0x%016llx\t", vcpu->regs.rbp);
+    printf("rdi    = 0x%016llx\t", vcpu->regs.rdi);
+    printf("rsi    = 0x%016llx\n", vcpu->regs.rsi);
+#define RECUR_CALL(x) printf("r[%02d]    = 0x%016llx\n", x, vcpu->regs.r ## x)
     RECUR_CALL(8);
     RECUR_CALL(9);
     RECUR_CALL(10);
@@ -552,17 +479,17 @@ int print_regs(struct vm *vm)
     RECUR_CALL(15);
 	
 	
-    printf("rflags = 0x%016llx\t", vm->regs.rflags);
-    printf("efer   = 0x%016llx\t", vm->sregs.efer);
-    printf("cr0    = 0x%016llx\n", vm->sregs.cr0);
-    printf("cr2    = 0x%016llx\t", vm->sregs.cr2);
-    printf("cr3    = 0x%016llx\t", vm->sregs.cr3);        
-    printf("cr4    = 0x%016llx\n", vm->sregs.cr4);
+    printf("rflags = 0x%016llx\t", vcpu->regs.rflags);
+    printf("efer   = 0x%016llx\t", vcpu->sregs.efer);
+    printf("cr0    = 0x%016llx\n", vcpu->sregs.cr0);
+    printf("cr2    = 0x%016llx\t", vcpu->sregs.cr2);
+    printf("cr3    = 0x%016llx\t", vcpu->sregs.cr3);        
+    printf("cr4    = 0x%016llx\n", vcpu->sregs.cr4);
     for(i = 0; i < 4; i++)
-	printf("db[%d]  = 0x%016llx\n", i, vm->dregs.db[i]);
-    printf("dr6    = 0x%016llx\t", vm->dregs.dr6);
-    printf("dr7    = 0x%016llx\t", vm->dregs.dr7);
-    printf("flags  = 0x%016llx\n", vm->dregs.flags);
-    print_segment(&vm->sregs.cs);
+	printf("db[%d]  = 0x%016llx\n", i, vcpu->dregs.db[i]);
+    printf("dr6    = 0x%016llx\t", vcpu->dregs.dr6);
+    printf("dr7    = 0x%016llx\t", vcpu->dregs.dr7);
+    printf("flags  = 0x%016llx\n", vcpu->dregs.flags);
+    print_segment(&vcpu->sregs.cs);
     printf("--------------------------------\n");    
 }
