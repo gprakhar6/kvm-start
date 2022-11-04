@@ -14,7 +14,7 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 #include <semaphore.h>
-
+#include <elf.h>
 #include "globvar.h"
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
@@ -25,15 +25,15 @@
 	exit(1);							\
     } while(0)
 #define ONE_PAGE (0x1000)
-#define CODE_START (0x1000)
-#define STACK_START (0xA000)
-
+#define STACK_START (0x20000)
+#define GUEST_MEMORY (1024 * ONE_PAGE) // 4 mb
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
 
 typedef struct
 {
     int vcpufd;
+    uint8_t id;
     pthread_t tid;
     struct kvm_run *run;
     struct kvm_sregs sregs;
@@ -70,6 +70,7 @@ void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(t_vcpu *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
+Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 
 int main()
 {
@@ -118,6 +119,12 @@ static inline void handle_io_port(t_vcpu *vcpu)
 	printf("PORT_PRINT_REGS IO:\n");
 	print_regs(vcpu);
 	break;
+    case PORT_MY_ID:
+	if (vcpu->run->io.direction == KVM_EXIT_IO_IN &&
+	    vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
+	    *(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset) = vcpu->id;
+	}
+	break;
     default:
 	print_regs(vcpu);
 	fatal("unhandled KVM_EXIT_IO, %X\n", vcpu->run->io.port);
@@ -129,7 +136,7 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
 {
     int err;
     err = 0;
-    vm->phy_mem_size = 1024 * ONE_PAGE;
+    vm->phy_mem_size = GUEST_MEMORY;
     vm->mem = mmap(NULL, vm->phy_mem_size, PROT_READ | PROT_WRITE,
 	       MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
 
@@ -220,8 +227,8 @@ void *create_vcpu(void *vvcpu)
 	    .rip = vcpu->entry,
 	    .rax = 2,
 	    .rbx = 2,
-	    .rsp = vcpu->stack_start, /* temporary stack */
-	    .rdi = vcpu->stack_start,
+	    .rsp = vcpu->stack_start,
+	    .rdi = vcpu->stack_start,	    
 	    .rsi = 0,
 	    .rflags = 0x2
 	};
@@ -268,6 +275,7 @@ finish:
 
 void setup_vcpus(struct vm *vm)
 {
+    uint8_t start_id;
     int i;
     unsigned long vcpu_id;
     vm->vcpu = calloc(vm->ncpu, sizeof(*(vm->vcpu)));
@@ -290,12 +298,16 @@ void setup_vcpus(struct vm *vm)
 	    fatal("run error\n");
 
 	vm->vcpu[i].entry = vm->entry;
-	vm->vcpu[i].stack_start = vm->stack_start + i * 0x4000;
+	// give 1 page for stack for the runtime
+	// I hope i never need more than this
+	vm->vcpu[i].stack_start = vm->stack_start + i * PAGE_SIZE;
     }
 
+    start_id = 0;
     // start all the vcpu threads
     for(i = 0; i < vm->ncpu; i++) {
 	vm->vcpu[i].tid = -1;
+	vm->vcpu[i].id = start_id++;
 	if(pthread_create(&(vm->vcpu[i].tid), NULL, create_vcpu, &(vm->vcpu[i]))) {
 	    fatal("Couldnt create thread for user code creation\n");
 	}
@@ -314,7 +326,8 @@ int setup_bootcode(struct vm *vm)
     void *saddr;
     Elf64_Addr daddr;
     struct elf64_file elf;
-
+    Elf64_Shdr* shdr;
+    
     // to make all vcpu wait at barrier
     sem_init(&vcpu_init_barrier, 0, 0);
 
@@ -329,7 +342,12 @@ int setup_bootcode(struct vm *vm)
     }
 
     vm->entry = elf.ehdr.e_entry;
-    vm->stack_start = STACK_START; // TBD get from elf
+    shdr = get_shdr(&elf, ".stack");
+    if(shdr == NULL)
+	fatal("no stack section found for boot\n");
+    vm->stack_start = shdr->sh_addr + shdr->sh_size; // TBD get from elf
+    //printf("stack for boot = %016lX\n", vm->stack_start);
+    //exit(1);
     fini_elf64_file(&elf);
 
     // tell all cpu code is ready and mapped
@@ -497,4 +515,22 @@ int print_regs(t_vcpu *vcpu)
     printf("flags  = 0x%016llx\n", vcpu->dregs.flags);
     print_segment(&vcpu->sregs.cs);
     printf("--------------------------------\n");
+}
+
+Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name)
+{
+    int i;
+    Elf64_Shdr *ret = NULL;
+    
+    for(i = 0; i < elf->ehdr.e_shnum; i++) {
+	int idx;
+	idx = elf->shdr[i].sh_name;
+	if(strcmp(&(elf->shstrtbl[idx]), name) == 0) {
+	    printf("idx = %d\n", i);
+	    ret = &(elf->shdr[i]);
+	    break;
+	}
+    }
+
+    return ret;
 }
