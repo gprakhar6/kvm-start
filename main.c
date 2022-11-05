@@ -71,7 +71,7 @@ void setup_device_loop(struct vm *vm);
 int print_regs(t_vcpu *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
-
+uint8_t report[256] = {0};
 int main()
 {
     int i, ret;
@@ -80,7 +80,7 @@ int main()
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);
     setup_bootcode(&vm);
-    vm.ncpu = 2;
+    vm.ncpu = 256;
     setup_vcpus(&vm);
     //setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
@@ -92,6 +92,11 @@ int main()
 	pthread_join(vm.vcpu[i].tid, NULL);
     printf("All cpu thread joined\n");
 
+    for(i = 0; i < vm.ncpu; i++)
+	if(report[i] == 0) {
+	    printf("%d did not report\n", i);
+	}
+    
     return 0;
 }
 
@@ -120,9 +125,18 @@ static inline void handle_io_port(t_vcpu *vcpu)
 	print_regs(vcpu);
 	break;
     case PORT_MY_ID:
-	if (vcpu->run->io.direction == KVM_EXIT_IO_IN &&
-	    vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
-	    *(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset) = vcpu->id;
+	if(vcpu->run->io.direction == KVM_EXIT_IO_IN) {
+	    if (vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
+		*(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset) = vcpu->id;
+	    }
+	}
+	else {
+	    uint8_t v;
+	    // out direction
+	    if (vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
+		v = *(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset);
+		report[v] = 1;
+	    }	    
 	}
 	break;
     default:
@@ -204,6 +218,8 @@ int get_vm(struct vm *vm)
     // not sure about its correctness
     ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
     printf("nr_vcpus = %d\n", ret);
+    ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS);
+    printf("max_vcpus = %d\n", ret);
     return err;
 }
 
@@ -270,7 +286,8 @@ void *create_vcpu(void *vvcpu)
     }
 
 finish:
-    print_regs(vcpu);
+    //print_regs(vcpu);
+    return;
 }
 
 void setup_vcpus(struct vm *vm)
