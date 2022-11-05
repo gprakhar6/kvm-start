@@ -300,6 +300,8 @@ void setup_vcpus(struct vm *vm)
 	vm->vcpu[i].entry = vm->entry;
 	// give 1 page for stack for the runtime
 	// I hope i never need more than this
+	// also stack_start has my_id, it will break if stack size changes
+	// more than one page.
 	vm->vcpu[i].stack_start = vm->stack_start + i * PAGE_SIZE;
     }
 
