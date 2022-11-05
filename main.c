@@ -80,7 +80,7 @@ int main()
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);
     setup_bootcode(&vm);
-    vm.ncpu = 256;
+    vm.ncpu = 255;
     setup_vcpus(&vm);
     //setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
