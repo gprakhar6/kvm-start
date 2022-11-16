@@ -19,6 +19,8 @@
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 
+#define __IRQCHIP__
+
 #define fatal(s, ...) do {\
 	printf("%04d: %s :",__LINE__, strerror(errno));			\
 	printf(s, ##__VA_ARGS__);					\
@@ -34,6 +36,7 @@ typedef struct
 {
     int vcpufd;
     uint8_t id;
+    uint8_t pool_size;
     pthread_t tid;
     struct kvm_run *run;
     struct kvm_sregs sregs;
@@ -60,7 +63,7 @@ struct vm {
 struct timeval t1, t2;
 sem_t vcpu_init_barrier;
 
-static inline void handle_io_port(t_vcpu *vcpu);
+static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
 void setup_vcpus(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
@@ -70,6 +73,7 @@ void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(t_vcpu *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
+void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 uint8_t report[256] = {0};
 int main()
@@ -80,7 +84,7 @@ int main()
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);
     setup_bootcode(&vm);
-    vm.ncpu = 255;
+    vm.ncpu = 2;
     setup_vcpus(&vm);
     //setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
@@ -100,7 +104,7 @@ int main()
     return 0;
 }
 
-static inline void handle_io_port(t_vcpu *vcpu)
+static inline int handle_io_port(t_vcpu *vcpu)
 {
     char c;
     switch(vcpu->run->io.port) {
@@ -118,16 +122,17 @@ static inline void handle_io_port(t_vcpu *vcpu)
     case PORT_HLT:
 	printf("Halt port IO\n");
 	print_regs(vcpu);
-	exit(0);
+	return 1;
 	break;
     case PORT_PRINT_REGS:
 	printf("PORT_PRINT_REGS IO:\n");
 	print_regs(vcpu);
 	break;
-    case PORT_MY_ID:
+    case PORT_MY_ID: // POOL_SZ << 8 | CPU_ID
 	if(vcpu->run->io.direction == KVM_EXIT_IO_IN) {
-	    if (vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
-		*(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset) = vcpu->id;
+	    if (vcpu->run->io.size == 2 && vcpu->run->io.count == 1) {
+		*(uint16_t *)(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset) =
+		    ((uint16_t)(vcpu->pool_size) << 8) | (uint16_t)vcpu->id;
 	    }
 	}
 	else {
@@ -144,6 +149,8 @@ static inline void handle_io_port(t_vcpu *vcpu)
 	fatal("unhandled KVM_EXIT_IO, %X\n", vcpu->run->io.port);
 	break;
     }
+
+    return 0;
 }
 
 int setup_guest_phy2_host_virt_map(struct vm *vm)
@@ -212,9 +219,10 @@ int get_vm(struct vm *vm)
 
     // all future vcpus will now have irqchip
     //print_cpuid_output(vm->cpuid2);
-//    if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
-//	fatal("Unable to create IRQCHIP\n");
-
+#ifdef __IRQCHIP__    
+    if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
+	fatal("Unable to create IRQCHIP\n");
+#endif
     // not sure about its correctness
     ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
     printf("nr_vcpus = %d\n", ret);
@@ -227,7 +235,15 @@ void *create_vcpu(void *vvcpu)
 {
     t_vcpu *vcpu = vvcpu;
     int ret;
+    struct kvm_lapic_state lapic_state;
 
+#ifdef __IRQCHIP__
+    if(ioctl(vcpu->vcpufd, KVM_GET_LAPIC, &lapic_state)) {
+	fatal("Could not get the lapic state");
+    }
+#endif    
+    //print_lapic_state(&lapic_state);
+    
     printf("In vcpu thread %ld\n", vcpu->tid);
     // to get the real mode running
     if(ioctl(vcpu->vcpufd, KVM_GET_SREGS, &(vcpu->sregs)) < 0)
@@ -268,7 +284,8 @@ void *create_vcpu(void *vvcpu)
 	    goto finish;
 	    break;
 	case KVM_EXIT_IO:
-	    handle_io_port(vcpu);
+	    if(handle_io_port(vcpu))
+		return;
 	    break;
 	case KVM_EXIT_SHUTDOWN:
 	    print_regs(vcpu);
@@ -286,7 +303,7 @@ void *create_vcpu(void *vvcpu)
     }
 
 finish:
-    //print_regs(vcpu);
+    print_regs(vcpu);
     return;
 }
 
@@ -320,6 +337,7 @@ void setup_vcpus(struct vm *vm)
 	// also stack_start has my_id, it will break if stack size changes
 	// more than one page.
 	vm->vcpu[i].stack_start = vm->stack_start + i * PAGE_SIZE;
+	vm->vcpu[i].pool_size = vm->ncpu;
     }
 
     start_id = 0;
@@ -534,6 +552,13 @@ int print_regs(t_vcpu *vcpu)
     printf("flags  = 0x%016llx\n", vcpu->dregs.flags);
     print_segment(&vcpu->sregs.cs);
     printf("--------------------------------\n");
+}
+
+void print_lapic_state(struct kvm_lapic_state *lapic)
+{
+    int i;
+    for(i = 0; i < 0x40; i++)
+	printf("[%03X] = %08X\n", i << 4, *(uint32_t *)&lapic->regs[i << 4]);
 }
 
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name)
