@@ -42,6 +42,7 @@ typedef struct
     struct kvm_sregs sregs;
     struct kvm_regs regs;
     struct kvm_debugregs dregs;
+    struct kvm_cpuid2 *cpuid2;    
     uint64_t entry;
     uint64_t stack_start;
 } t_vcpu;
@@ -236,19 +237,33 @@ void *create_vcpu(void *vvcpu)
     t_vcpu *vcpu = vvcpu;
     int ret;
     struct kvm_lapic_state lapic_state;
-
+    struct kvm_mp_state mp_state;
+    
 #ifdef __IRQCHIP__
     if(ioctl(vcpu->vcpufd, KVM_GET_LAPIC, &lapic_state)) {
 	fatal("Could not get the lapic state");
     }
 #endif    
     //print_lapic_state(&lapic_state);
+    mp_state.mp_state = 1;
+    while(mp_state.mp_state != 0) {
+    //while(0 && (vcpu->id != 0)) {
+	if(ioctl(vcpu->vcpufd, KVM_GET_MP_STATE, &mp_state)) {
+	    fatal("Cannot fetch MP_STATE");
+	}
+	printf("MP_STATE for %d = %d\n", vcpu->id, mp_state.mp_state);
+	sleep(1);
+    }
     
     printf("In vcpu thread %ld\n", vcpu->tid);
+    if(ioctl(vcpu->vcpufd, KVM_SET_CPUID2, vcpu->cpuid2) < 0)
+	fatal("cannot set cpuid things\n");    
     // to get the real mode running
     if(ioctl(vcpu->vcpufd, KVM_GET_SREGS, &(vcpu->sregs)) < 0)
 	fatal("cant set get sregs tid = %ld\n", vcpu->tid);
 
+    //printf("cs.base = %llX\n",vcpu->sregs.cs.base);
+    //printf("cs.selector = %llX\n",vcpu->sregs.cs.selector);
     vcpu->sregs.cs.base = 0;
     vcpu->sregs.cs.selector = 0;
     if(ioctl(vcpu->vcpufd, KVM_SET_SREGS, &(vcpu->sregs)) < 0)
@@ -298,6 +313,7 @@ void *create_vcpu(void *vvcpu)
 	    fatal("KVM_EXIT_FAIL_ENTRY\n");
 	    break;
 	default:
+	    fatal("exit_reason = %d\n, exiting\n", vcpu->run->exit_reason);
 	    break;
 	}
     }
@@ -323,14 +339,12 @@ void setup_vcpus(struct vm *vm)
 	if(vm->vcpu[i].vcpufd == -1)
 	    fatal("Cannot create vcpu\n");
 
-	if(ioctl(vm->vcpu[i].vcpufd, KVM_SET_CPUID2, vm->cpuid2) < 0)
-	    fatal("cannot set cpuid things\n");
-
 	vm->vcpu[i].run = mmap(NULL, vm->mmap_size, PROT_READ | PROT_WRITE,
 			       MAP_SHARED, vm->vcpu[i].vcpufd, 0);
 	if(!vm->vcpu[i].run)
 	    fatal("run error\n");
 
+	vm->vcpu[i].cpuid2 = vm->cpuid2;
 	vm->vcpu[i].entry = vm->entry;
 	// give 1 page for stack for the runtime
 	// I hope i never need more than this
