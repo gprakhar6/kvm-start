@@ -85,7 +85,7 @@ int main()
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);
     setup_bootcode(&vm);
-    vm.ncpu = 2;
+    vm.ncpu = 3;
     setup_vcpus(&vm);
     //setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
@@ -252,7 +252,7 @@ void *create_vcpu(void *vvcpu)
 	    fatal("Cannot fetch MP_STATE");
 	}
 	printf("MP_STATE for %d = %d\n", vcpu->id, mp_state.mp_state);
-	sleep(1);
+	//sleep(1);
     }
     
     printf("In vcpu thread %ld\n", vcpu->tid);
