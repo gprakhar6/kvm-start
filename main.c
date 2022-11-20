@@ -133,6 +133,7 @@ static inline int handle_io_port(t_vcpu *vcpu)
 	printf("Joined\n");
 	break;
     case PORT_HLT:
+	exit(-1);
 	printf("Halt port IO\n");
 	print_regs(vcpu);
 	return 1;
@@ -248,9 +249,9 @@ int get_vm(struct vm *vm)
 #endif
     // not sure about its correctness
     ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
-    printf("nr_vcpus = %d\n", ret);
+    //printf("nr_vcpus = %d\n", ret);
     ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS);
-    printf("max_vcpus = %d\n", ret);
+    //printf("max_vcpus = %d\n", ret);
     
     return err;
 }
@@ -280,7 +281,7 @@ void *create_vcpu(void *vvcpu)
 	//sleep(1);
     }
     
-    printf("In vcpu thread %ld\n", vcpu->tid);
+    //printf("In vcpu thread %ld\n", vcpu->tid);
     if(ioctl(vcpu->vcpufd, KVM_SET_CPUID2, vcpu->cpuid2) < 0)
 	fatal("cannot set cpuid things\n");    
     // to get the real mode running
@@ -311,10 +312,10 @@ void *create_vcpu(void *vvcpu)
 	if(ret == -1)
 	    fatal("Cannot set regs in vcpu thread");
 
-	printf("entry = %lx, stack_start = %lx\n", vcpu->entry, vcpu->stack_start);
+	//printf("entry = %lx, stack_start = %lx\n", vcpu->entry, vcpu->stack_start);
     }
 
-    printf("before run vcpu %ld\n", vcpu->tid);
+    //printf("before run vcpu %ld\n", vcpu->tid);
     while(1) {
 	ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
 	if(ret == -1)
@@ -363,7 +364,7 @@ void setup_vcpus(struct vm *vm)
     for(i = 0; i < vm->ncpu; i++) {
 	vcpu_id = i;
 	vm->vcpu[i].vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, vcpu_id);
-	printf("vcpufd = %d\n", vm->vcpu[i].vcpufd);
+	//printf("vcpufd = %d\n", vm->vcpu[i].vcpufd);
 	if(vm->vcpu[i].vcpufd == -1)
 	    fatal("Cannot create vcpu\n");
 
@@ -393,7 +394,7 @@ void setup_vcpus(struct vm *vm)
 	    fatal("Couldnt create thread for user code creation\n");
 	}
 	else {
-	    printf("Created vcpu thread with tid  = %ld\n", vm->vcpu[i].tid);
+	    //printf("Created vcpu thread with tid  = %ld\n", vm->vcpu[i].tid);
 	}
     }
     // only after all vcpus are created
@@ -617,7 +618,7 @@ Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name)
 	int idx;
 	idx = elf->shdr[i].sh_name;
 	if(strcmp(&(elf->shstrtbl[idx]), name) == 0) {
-	    printf("idx = %d\n", i);
+	    //printf("idx = %d\n", i);
 	    ret = &(elf->shdr[i]);
 	    break;
 	}
