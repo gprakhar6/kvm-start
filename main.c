@@ -68,6 +68,7 @@ struct vm {
 };
 
 struct timeval t1, t2;
+uint64_t tsc_t1, tsc_t2;
 sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
 sem_t sem_booted, sem_usercode_loaded;
 
@@ -84,16 +85,24 @@ void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 uint8_t report[256] = {0};
+
+static inline uint64_t tsc()
+{
+    uint64_t rax;
+    asm volatile("rdtscp\n": "=a"(rax));
+
+    return rax;
+}
+
 int main()
 {
     int i, ret;
     struct vm vm;
 
-    ts(t1);
     get_vm(&vm);
     setup_guest_phy2_host_virt_map(&vm);
     setup_bootcode(&vm);
-    vm.ncpu = 64;
+    vm.ncpu = 10;
     setup_vcpus(&vm);
     
     //setup_irqfd(&vm, 1);
@@ -124,6 +133,9 @@ void decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    sem_post(&sem_vcpu_init[i]);
 	break;
     case 2: // booted
+	ts(t2);
+	tsc_t2 = tsc();
+	printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);	
 	sem_post(&sem_booted);
 	sem_wait(&sem_usercode_loaded);
 	break;
@@ -146,14 +158,15 @@ static inline int handle_io_port(t_vcpu *vcpu)
 	break;
     case PORT_WAIT_USER_CODE_MAPPING: /* For waiting for user code creation thread */
 	sem_wait(&vcpu_init_barrier);
-	printf("Joined\n");
+	//printf("Joined\n");
 	break;
     case PORT_HLT:
+	tsc_t2 = tsc();
 	ts(t2);
-	printf("time = %ld\n", dt(t2, t1));
+	printf("time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);
 	printf("Halt port IO\n");
-	exit(-1);
 	print_regs(vcpu);
+	exit(-1);
 	return 1;
 	break;
     case PORT_PRINT_REGS:
@@ -207,6 +220,7 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
     if(!vm->kmem)
 	fatal("cant mmap\n");
 
+    //mlock(vm->kmem, vm->kphy_mem_size);
     vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);
     // set up memory mapping
     {
@@ -341,6 +355,8 @@ void *create_vcpu(void *vvcpu)
     }
 
     //printf("before run vcpu %ld\n", vcpu->tid);
+    tsc_t1 = tsc();
+    ts(t1);
     while(1) {
 	ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
 	if(ret == -1)
@@ -457,7 +473,7 @@ int setup_bootcode(struct vm *vm)
     vm->stack_start = shdr->sh_addr + shdr->sh_size;
     shdr = get_shdr(&elf, ".paging");
     vm->kern_end = shdr->sh_addr + shdr->sh_size;
-    printf("kern_end = %016lX\n", vm->kern_end);
+    //printf("kern_end = %016lX\n", vm->kern_end);
     //printf("stack for boot = %016lX\n", vm->stack_start);
     //exit(1);
     fini_elf64_file(&elf);
@@ -476,12 +492,12 @@ int setup_usercode(struct vm *vm)
     void *saddr;
     Elf64_Addr daddr;
     const char u_object_file[] = "tmp/main.o";
-    const char u_executable[] = "tmp/main.elf";
+    const char u_executable[] = "tmp/main";
     char cmd[1024] = "bash create_executable.sh ";
     struct elf64_file elf;
     struct kvm_mp_state mp_state;
     
-    sem_wait(&sem_booted);
+    //sem_wait(&sem_booted);
 
     vm->uphy_mem_size = 4 * 1024 * 1024;
     vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
@@ -503,11 +519,11 @@ int setup_usercode(struct vm *vm)
 	}	
     }
     
-    printf("slot 1 userspace now has memory\n");
+    //printf("slot 1 userspace now has memory\n");
     //return;
-    printf("Creating usercode\n");
+    //printf("Creating usercode\n");
     strncat(cmd, u_object_file, sizeof(cmd)-1);
-    printf("executing cmd: %s\n",cmd);
+    //printf("executing cmd: %s\n",cmd);
     /*
     if(system(cmd))
 	fatal("linking user code failed\n");
@@ -520,7 +536,7 @@ int setup_usercode(struct vm *vm)
 	uint8_t *hmem = vm->umem;
 	uint8_t *umem = (uint8_t *)((uint64_t)vm->kphy_mem_size); // this is the end of kern 2MB
 	uint64_t kmem = vm->kern_end;
-	uint64_t *upt  = (uint64_t *)&(vm->kmem[vm->kern_end]);
+	uint64_t *upt  = (uint64_t *)&(vm->kmem[kmem]);
 	uint64_t ptidx, hudiff;
 	Elf64_Shdr* shdr;
 
@@ -530,7 +546,7 @@ int setup_usercode(struct vm *vm)
 	shdr = get_shdr(&elf, ".stack");
 	vm->metadata->func_info[0].stack_load_addr = \
 	    shdr->sh_addr + shdr->sh_size;
-	vm->metadata->func_info[0].entry_addr = 0x80000000; // TBD
+	vm->metadata->func_info[0].entry_addr = elf.ehdr.e_entry;
 	for(i = 0; i < elf.num_regions; i++) {
 	    vaddr = elf.prog_regions[i]->vaddr;
 	    saddr = elf.prog_regions[i]->addr;
@@ -538,12 +554,14 @@ int setup_usercode(struct vm *vm)
 	    if(upt[ptidx] == 0) {
 		//printf("umem = %016lX\n", (uint64_t)umem);
 		upt[ptidx] = ((uint64_t)umem & (~PAGE_MASK)) |	\
-		    0x87; // present,writable,big,user
+		    0x087; // big,X,X,X,X,user,writable,present
 	    }
 	    daddr = (Elf64_Addr)(((upt[ptidx] & (~PAGE_MASK)) |		\
 				 (vaddr & PAGE_MASK)) + hudiff);
+	    /*
 	    printf("ptidx = %ld, vaddr = %016lX\n",
 		   ptidx, vaddr);
+	    */
 	    fsz = elf.prog_regions[i]->filesz;
 	    msz = elf.prog_regions[i]->memsz;
 	    //printf("%02d: %016lx %016lx %04d %04d\n\n", i, daddr, (uint64_t)saddr, fsz, msz);
@@ -552,7 +570,7 @@ int setup_usercode(struct vm *vm)
 	kmem += 512*8;
     }
     sem_post(&sem_usercode_loaded);
-    printf("Completed user code creation\n");
+    //printf("Completed user code creation\n");
     fini_elf64_file(&elf);
 }
 
@@ -649,6 +667,7 @@ int print_regs(t_vcpu *vcpu)
     if(ret == -1)
 	fatal("cant get debug regs\n");
     printf("--------------------------------\n");
+    printf("id     = %d\n", vcpu->id);
     printf("rip    = 0x%016llx\t", vcpu->regs.rip);
     printf("rax    = 0x%016llx\t", vcpu->regs.rax);
     printf("rbx    = 0x%016llx\n", vcpu->regs.rbx);
