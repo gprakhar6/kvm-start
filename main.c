@@ -22,14 +22,18 @@
 
 #define __IRQCHIP__
 
-#define fatal(s, ...) do {\
-	printf("%04d: %s :",__LINE__, strerror(errno));			\
-	printf(s, ##__VA_ARGS__);					\
-	exit(1);							\
+#define fatal(s, ...) do {				\
+	printf("%04d: %s :",__LINE__, strerror(errno));	\
+	printf(s, ##__VA_ARGS__);			\
+	exit(1);					\
     } while(0)
+
+#define _MB       (1024 * 1024)
 #define ONE_PAGE (0x1000)
 #define GUEST_MEMORY (4 * 1024 * 1024)
 #define PAGE_MASK (0x1FFFFF)
+
+#define ARR_SZ_1D(x) (sizeof(x)/sizeof(x[0]))
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
 
@@ -112,6 +116,8 @@ int main()
     //printf("Timer thread joined\n");
 
     setup_usercode(&vm);
+
+    vm.metadata.sched_status.sched_init = 1;
     
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
@@ -214,13 +220,14 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
     err = 0;
     vm->kphy_mem_size = GUEST_MEMORY;
     vm->kmem = mmap(NULL, vm->kphy_mem_size, PROT_READ | PROT_WRITE,
-	       MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
+		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
 
     // should check MAP_FAILED TBD
     if(!vm->kmem)
 	fatal("cant mmap\n");
 
     //mlock(vm->kmem, vm->kphy_mem_size);
+    // TBD hopefully zero at init, cant have state machine with junk state
     vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);
     // set up memory mapping
     {
@@ -312,7 +319,7 @@ void *create_vcpu(void *vvcpu)
     sem_wait(vcpu->sem_vcpu_init);
     while(mp_state.mp_state != 0) {
 	
-    //while(0 && (vcpu->id != 0)) {
+	//while(0 && (vcpu->id != 0)) {
 	if(ioctl(vcpu->vcpufd, KVM_GET_MP_STATE, &mp_state)) {
 	    fatal("Cannot fetch MP_STATE");
 	}
@@ -488,18 +495,28 @@ int setup_bootcode(struct vm *vm)
 int setup_usercode(struct vm *vm)
 {
     int ret;
-    int i, fsz, msz;
+    int i, j, fsz, msz;
     void *saddr;
     Elf64_Addr daddr;
     const char u_object_file[] = "tmp/main.o";
-    const char u_executable[] = "tmp/main";
+    const char u_executable[][128] = {
+	"tmp/main",
+	"tmp/main",
+    };
     char cmd[1024] = "bash create_executable.sh ";
     struct elf64_file elf;
     struct kvm_mp_state mp_state;
+    uint64_t vaddr;
+    uint8_t *hmem;
+    uint8_t *umem;
+    uint64_t kmem;
+    uint64_t *upt;
+    uint64_t ptidx, hudiff;
+    Elf64_Shdr* shdr;
     
     //sem_wait(&sem_booted);
 
-    vm->uphy_mem_size = 4 * 1024 * 1024;
+    vm->uphy_mem_size = 8 * 1024 * 1024;
     vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
 		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
     
@@ -525,28 +542,24 @@ int setup_usercode(struct vm *vm)
     strncat(cmd, u_object_file, sizeof(cmd)-1);
     //printf("executing cmd: %s\n",cmd);
     /*
-    if(system(cmd))
-	fatal("linking user code failed\n");
+      if(system(cmd))
+      fatal("linking user code failed\n");
     */
     init_limits(limit_file);
-    init_elf64_file(u_executable, &elf);
-
-    {
-	uint64_t vaddr;
-	uint8_t *hmem = vm->umem;
-	uint8_t *umem = (uint8_t *)((uint64_t)vm->kphy_mem_size); // this is the end of kern 2MB
-	uint64_t kmem = vm->kern_end;
-	uint64_t *upt  = (uint64_t *)&(vm->kmem[kmem]);
-	uint64_t ptidx, hudiff;
-	Elf64_Shdr* shdr;
-
-	hudiff = (uint64_t)hmem - (uint64_t)umem;
-	memset(upt, 0, 512 * 8);
-	vm->metadata->func_info[0].pt_addr = kmem;
+    hmem = vm->umem; // host virt addr
+    // guest phy addrthis is the end of kern 2MB
+    umem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
+    kmem = vm->kern_end; // guest physical addr
+    upt  = (typeof(upt))(&(vm->kmem[kmem]));
+    hudiff = (uint64_t)hmem - (uint64_t)umem;    
+    for(j = 0; j < ARR_SZ_1D(u_executable); j++) {
+	init_elf64_file(&u_executable[j][0], &elf);
+	memset(upt, 0, 512 * 8); // page table zeroing TBD, probably already zero
+	vm->metadata->func_info[j].pt_addr = kmem;
 	shdr = get_shdr(&elf, ".stack");
-	vm->metadata->func_info[0].stack_load_addr = \
+	vm->metadata->func_info[j].stack_load_addr = \
 	    shdr->sh_addr + shdr->sh_size;
-	vm->metadata->func_info[0].entry_addr = elf.ehdr.e_entry;
+	vm->metadata->func_info[j].entry_addr = elf.ehdr.e_entry;
 	for(i = 0; i < elf.num_regions; i++) {
 	    vaddr = elf.prog_regions[i]->vaddr;
 	    saddr = elf.prog_regions[i]->addr;
@@ -555,12 +568,14 @@ int setup_usercode(struct vm *vm)
 		//printf("umem = %016lX\n", (uint64_t)umem);
 		upt[ptidx] = ((uint64_t)umem & (~PAGE_MASK)) |	\
 		    0x087; // big,X,X,X,X,user,writable,present
+		umem = (typeof(umem))((uint64_t)umem + 2 * _MB);
+		printf("Increased umem\n");
 	    }
 	    daddr = (Elf64_Addr)(((upt[ptidx] & (~PAGE_MASK)) |		\
-				 (vaddr & PAGE_MASK)) + hudiff);
+				  (vaddr & PAGE_MASK)) + hudiff);
 	    /*
-	    printf("ptidx = %ld, vaddr = %016lX\n",
-		   ptidx, vaddr);
+	      printf("ptidx = %ld, vaddr = %016lX\n",
+	      ptidx, vaddr);
 	    */
 	    fsz = elf.prog_regions[i]->filesz;
 	    msz = elf.prog_regions[i]->memsz;
@@ -568,10 +583,49 @@ int setup_usercode(struct vm *vm)
 	    memcpy((void *)daddr, saddr, fsz);
 	}
 	kmem += 512*8;
+	if(kmem >= (2 * _MB)) {
+	    fatal("Crossed kernel 2MB for page tables");
+	}
+	fini_elf64_file(&elf);
     }
+    /*
+      dag repr:
+      num_nodes
+      in_vertex_count_per_node
+      start_of_out_vertex_idxes
+
+          1
+        /   \
+       0     3
+        \   /
+          2
+
+      output repr:
+      4  // num_nodes
+      0  // 0 in count
+      1  // 1 in count
+      1  // 2 in count
+      2  // 3 in count
+      0  // 0 start_idx 
+      2  // 1 start_idx 
+      3  // 2 start_idx 
+      4  // 3 start_idx  (no out edge so same idxes)
+      4  // 3 end_idx 
+      1  // out_edge 0
+      2
+      3  // out_edge 1
+      3  // out_edge 2
+     */
+    vm->metadata->node_nums = ARR_SZ_1D(u_executable);
+    vm->metadata->dag[0] = 0; // in nodes 0
+    vm->metadata->dag[1] = 1; // in nodes 1
+    vm->metadata->dag[2] = 0; // 0 start_idx
+    vm->metadata->dag[3] = 1; // 1 start_idx
+    vm->metadata->dag[4] = 1;
+    vm->metadata->dag[5] = 0;
+    vm->metadata->dag[6] = 1;
     sem_post(&sem_usercode_loaded);
     //printf("Completed user code creation\n");
-    fini_elf64_file(&elf);
 }
 
 void* timer_event_loop(void *vvm)
