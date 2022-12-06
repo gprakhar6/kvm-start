@@ -117,7 +117,7 @@ int main()
 
     setup_usercode(&vm);
 
-    vm.metadata.sched_status.sched_init = 1;
+    vm.metadata->sched_status.sched_init = 1;
     
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
@@ -298,7 +298,9 @@ int get_vm(struct vm *vm)
 
     sem_init(&sem_booted, 0, 0);
     sem_init(&sem_usercode_loaded, 0, 0);
-    
+
+    vm->metadata->bit_map_inactive_cpus = ~0;
+    vm->metadata->num_active_cpus = 0;
     return err;
 }
 
@@ -616,7 +618,7 @@ int setup_usercode(struct vm *vm)
       3  // out_edge 1
       3  // out_edge 2
      */
-    vm->metadata->node_nums = ARR_SZ_1D(u_executable);
+    vm->metadata->num_nodes = ARR_SZ_1D(u_executable);
     vm->metadata->dag[0] = 0; // in nodes 0
     vm->metadata->dag[1] = 1; // in nodes 1
     vm->metadata->dag[2] = 0; // 0 start_idx
@@ -624,6 +626,7 @@ int setup_usercode(struct vm *vm)
     vm->metadata->dag[4] = 1;
     vm->metadata->dag[5] = 0;
     vm->metadata->dag[6] = 1;
+    memset(vm->metadata->current, -1, sizeof(vm->metadata->current));
     sem_post(&sem_usercode_loaded);
     //printf("Completed user code creation\n");
 }
