@@ -116,8 +116,6 @@ int main()
     //printf("Timer thread joined\n");
 
     setup_usercode(&vm);
-
-    vm.metadata->sched_status.sched_init = 1;
     
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
@@ -130,30 +128,40 @@ int main()
     
     return 0;
 }
-void decode_msg(t_vcpu *vcpu, uint16_t msg)
+int decode_msg(t_vcpu *vcpu, uint16_t msg)
 {
     int i;
+    int ret = 0;
+    
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
 	for(i = 1; i < vcpu->pool_size; i++)
 	    sem_post(&sem_vcpu_init[i]);
 	break;
-    case 2: // booted
+    case 2: // MSG_BOOTED
 	ts(t2);
 	tsc_t2 = tsc();
 	printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);	
 	sem_post(&sem_booted);
 	sem_wait(&sem_usercode_loaded);
 	break;
+
+    case 3: // MSG_WAITING_FOR_WORK
+	printf("Waiting for work\n");
+	break;
     default:
 	fatal("Unknown msg from the guest");
 	break;
     }
+
+    return ret;
 }
 
 static inline int handle_io_port(t_vcpu *vcpu)
 {
     char c;
+    int ret;
+    
     switch(vcpu->run->io.port) {
     case PORT_SERIAL: /* for the printf function */
 	if (vcpu->run->io.direction == KVM_EXIT_IO_OUT &&
@@ -201,7 +209,7 @@ static inline int handle_io_port(t_vcpu *vcpu)
 	    if (vcpu->run->io.size == 2 && vcpu->run->io.count == 1) {
 		uint16_t msg;
 		msg = *(uint16_t *)(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset);
-		decode_msg(vcpu, msg);
+		ret = decode_msg(vcpu, msg);
 	    }
 	}
 	break;	
@@ -504,6 +512,8 @@ int setup_usercode(struct vm *vm)
     const char u_executable[][128] = {
 	"tmp/main",
 	"tmp/main",
+	"tmp/main",
+	"tmp/main",
     };
     char cmd[1024] = "bash create_executable.sh ";
     struct elf64_file elf;
@@ -552,9 +562,9 @@ int setup_usercode(struct vm *vm)
     // guest phy addrthis is the end of kern 2MB
     umem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
     kmem = vm->kern_end; // guest physical addr
-    upt  = (typeof(upt))(&(vm->kmem[kmem]));
     hudiff = (uint64_t)hmem - (uint64_t)umem;    
     for(j = 0; j < ARR_SZ_1D(u_executable); j++) {
+	upt  = (typeof(upt))(&(vm->kmem[kmem]));
 	init_elf64_file(&u_executable[j][0], &elf);
 	memset(upt, 0, 512 * 8); // page table zeroing TBD, probably already zero
 	vm->metadata->func_info[j].pt_addr = kmem;
@@ -618,15 +628,31 @@ int setup_usercode(struct vm *vm)
       3  // out_edge 1
       3  // out_edge 2
      */
+
+    /*
+          1
+        /   \
+       0     3
+        \   /
+          2
+    */
     vm->metadata->num_nodes = ARR_SZ_1D(u_executable);
     vm->metadata->dag[0] = 0; // in nodes 0
     vm->metadata->dag[1] = 1; // in nodes 1
-    vm->metadata->dag[2] = 0; // 0 start_idx
-    vm->metadata->dag[3] = 1; // 1 start_idx
-    vm->metadata->dag[4] = 1;
-    vm->metadata->dag[5] = 0;
-    vm->metadata->dag[6] = 1;
-    memset(vm->metadata->current, -1, sizeof(vm->metadata->current));
+    vm->metadata->dag[2] = 1; // in nodes 2
+    vm->metadata->dag[3] = 2; // in nodes 3
+    vm->metadata->dag[4] = 0;
+    vm->metadata->dag[5] = 2;
+    vm->metadata->dag[6] = 3;
+    vm->metadata->dag[7] = 4;
+    vm->metadata->dag[8] = 4;
+    vm->metadata->dag[9] = 1; // out 0
+    vm->metadata->dag[10] = 2;
+    vm->metadata->dag[11] = 3; // out 1
+    vm->metadata->dag[12] = 3; // out 2
+    vm->metadata->dag[13] = 0; // out 3
+    memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
+    vm->metadata->start_func = 0;
     sem_post(&sem_usercode_loaded);
     //printf("Completed user code creation\n");
 }

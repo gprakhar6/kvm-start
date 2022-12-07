@@ -25,11 +25,12 @@ typedef struct  {
 
 struct t_metadata {
     struct t_func_info func_info[MAX_FUNC];
-    uint64_t bit_map_inactive_cpus;
+    volatile uint64_t bit_map_inactive_cpus;
     uint64_t num_active_cpus;
     uint8_t current[64];
     t_sched_status sched_status;
     uint8_t num_nodes;
+    uint8_t start_func;
     uint16_t dag[MAX_DAG_ARR_SZ];
 };
     
