@@ -549,7 +549,7 @@ int setup_usercode(struct vm *vm)
     struct kvm_mp_state mp_state;
     uint64_t vaddr;
     uint8_t *hmem;
-    uint8_t *umem, *umem_s;
+    uint8_t *umem, *umem_s, *smem;
     uint64_t kmem;
     uint64_t *upt;
     uint64_t ptidx, hudiff;
@@ -558,7 +558,7 @@ int setup_usercode(struct vm *vm)
     //sem_wait(&sem_booted);
 
     // TBD proper allocation of phy memory
-    vm->uphy_mem_size = 2 * _MB * ARR_SZ_1D(u_executable);
+    vm->uphy_mem_size = 2 * _MB + 2 * _MB * ARR_SZ_1D(u_executable);
     vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
 		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
     
@@ -588,9 +588,10 @@ int setup_usercode(struct vm *vm)
       fatal("linking user code failed\n");
     */
     init_limits(limit_file);
-    umem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
+    smem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
+    umem = (uint8_t *)((uint64_t)vm->kphy_mem_size + 2 * _MB);
     umem_s = umem;
-    hmem = vm->umem; // host virt addr
+    hmem = (uint8_t *)((uint64_t)(vm->umem) + 2 * _MB); // host virt addr
     kmem = vm->kern_end; // guest physical addr
     hudiff = (uint64_t)hmem - (uint64_t)umem;
     for(j = 0; j < ARR_SZ_1D(u_executable); j++) {
@@ -598,6 +599,8 @@ int setup_usercode(struct vm *vm)
 	upt  = (typeof(upt))(&(vm->kmem[kmem]));
 	init_elf64_file(&u_executable[j][0], &elf);
 	memset(upt, 0, 512 * 8); // page table zeroing TBD, probably already zero
+	upt[0] = ((uint64_t)smem & (~PAGE_MASK)) |	\
+	    0x087; // big,X,X,X,X,user,writable,present	
 	vm->metadata->func_info[j].pt_addr = kmem;
 	shdr = get_shdr(&elf, ".stack");
 	vm->metadata->func_info[j].stack_load_addr = \
@@ -609,6 +612,7 @@ int setup_usercode(struct vm *vm)
 	    ptidx = (vaddr & 0x3FE00000) >> 21;
 	    if(upt[ptidx] == 0) {
 		//printf("umem = %016lX\n", (uint64_t)umem);
+		//printf("ptidx = %ld\n", ptidx);
 		upt[ptidx] = ((uint64_t)umem & (~PAGE_MASK)) |	\
 		    0x087; // big,X,X,X,X,user,writable,present
 		umem = (typeof(umem))((uint64_t)umem + 2 * _MB);
