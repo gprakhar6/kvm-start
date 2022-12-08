@@ -32,6 +32,7 @@ struct t_metadata {
     uint8_t num_nodes;
     uint8_t start_func;
     uint16_t dag[MAX_DAG_ARR_SZ];
+    uint16_t dag_in_count[MAX_FUNC]; // used by runtime
 };
     
 #endif

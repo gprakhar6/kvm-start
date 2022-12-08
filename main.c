@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <pthread.h>
@@ -36,7 +37,7 @@
 #define ARR_SZ_1D(x) (sizeof(x)/sizeof(x[0]))
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
-
+#define pdt() printf("dt = %ld us\n", dt(t2,t1));
 typedef struct
 {
     int vcpufd;
@@ -98,25 +99,48 @@ static inline uint64_t tsc()
     return rax;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
     int i, ret;
+    int time_the_fork = 0;
     struct vm vm;
 
-    get_vm(&vm);
-    setup_guest_phy2_host_virt_map(&vm);
-    setup_bootcode(&vm);
-    vm.ncpu = 10;
-    setup_vcpus(&vm);
+    switch(argc) {
+    case 0:
+    case 1:
+	break;
+    default:
+	if(strcmp(argv[1], "timeit") == 0) {
+	    printf("Timing the fork to boot time\n");
+	    time_the_fork = 1;
+	}
+	break;
+    }
+
+    if(time_the_fork == 1) {
+	ts(t1);
+	if(fork() != 0) {
+	    wait(&ret);
+	    ts(t2);
+	    pdt();
+	    exit(-1);
+	}
+    }
     
+    ts(t1);
+    get_vm(&vm); // 500 us
+    
+    setup_guest_phy2_host_virt_map(&vm); // 50 us
+    setup_bootcode(&vm); // 750 us
+    vm.ncpu = 4;
+
+    setup_vcpus(&vm); // 200 us
     //setup_irqfd(&vm, 1);
     //setup_device_loop(&vm); // start device thread
 
     //pthread_join(vm.tid_tmr, NULL);
     //printf("Timer thread joined\n");
-
-    setup_usercode(&vm);
-    
+    setup_usercode(&vm); // 290 us
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
     printf("All cpu thread joined\n");
@@ -139,15 +163,19 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    sem_post(&sem_vcpu_init[i]);
 	break;
     case 2: // MSG_BOOTED
-	ts(t2);
-	tsc_t2 = tsc();
-	printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);	
+	//ts(t2);
+	//tsc_t2 = tsc();
+	//printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);
 	sem_post(&sem_booted);
 	sem_wait(&sem_usercode_loaded);
 	break;
 
     case 3: // MSG_WAITING_FOR_WORK
+	t1 = t2;
+	ts(t2);
+	pdt();
 	printf("Waiting for work\n");
+	//exit(-1);	
 	break;
     default:
 	fatal("Unknown msg from the guest");
@@ -372,8 +400,8 @@ void *create_vcpu(void *vvcpu)
     }
 
     //printf("before run vcpu %ld\n", vcpu->tid);
-    tsc_t1 = tsc();
-    ts(t1);
+    //tsc_t1 = tsc();
+    //ts(t1);
     while(1) {
 	ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
 	if(ret == -1)
@@ -514,13 +542,14 @@ int setup_usercode(struct vm *vm)
 	"tmp/main",
 	"tmp/main",
 	"tmp/main",
+	"tmp/main",
     };
     char cmd[1024] = "bash create_executable.sh ";
     struct elf64_file elf;
     struct kvm_mp_state mp_state;
     uint64_t vaddr;
     uint8_t *hmem;
-    uint8_t *umem;
+    uint8_t *umem, *umem_s;
     uint64_t kmem;
     uint64_t *upt;
     uint64_t ptidx, hudiff;
@@ -528,7 +557,8 @@ int setup_usercode(struct vm *vm)
     
     //sem_wait(&sem_booted);
 
-    vm->uphy_mem_size = 8 * 1024 * 1024;
+    // TBD proper allocation of phy memory
+    vm->uphy_mem_size = 2 * _MB * ARR_SZ_1D(u_executable);
     vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
 		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
     
@@ -558,12 +588,13 @@ int setup_usercode(struct vm *vm)
       fatal("linking user code failed\n");
     */
     init_limits(limit_file);
-    hmem = vm->umem; // host virt addr
-    // guest phy addrthis is the end of kern 2MB
     umem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
+    umem_s = umem;
+    hmem = vm->umem; // host virt addr
     kmem = vm->kern_end; // guest physical addr
-    hudiff = (uint64_t)hmem - (uint64_t)umem;    
+    hudiff = (uint64_t)hmem - (uint64_t)umem;
     for(j = 0; j < ARR_SZ_1D(u_executable); j++) {
+    // guest phy addrthis is the end of kern 2MB
 	upt  = (typeof(upt))(&(vm->kmem[kmem]));
 	init_elf64_file(&u_executable[j][0], &elf);
 	memset(upt, 0, 512 * 8); // page table zeroing TBD, probably already zero
@@ -581,7 +612,7 @@ int setup_usercode(struct vm *vm)
 		upt[ptidx] = ((uint64_t)umem & (~PAGE_MASK)) |	\
 		    0x087; // big,X,X,X,X,user,writable,present
 		umem = (typeof(umem))((uint64_t)umem + 2 * _MB);
-		printf("Increased umem\n");
+		//printf("Increased umem\n");
 	    }
 	    daddr = (Elf64_Addr)(((upt[ptidx] & (~PAGE_MASK)) |		\
 				  (vaddr & PAGE_MASK)) + hudiff);
@@ -595,8 +626,11 @@ int setup_usercode(struct vm *vm)
 	    memcpy((void *)daddr, saddr, fsz);
 	}
 	kmem += 512*8;
-	if(kmem >= (2 * _MB)) {
+	if(kmem > (2 * _MB)) {
 	    fatal("Crossed kernel 2MB for page tables");
+	}
+	if((uint64_t)umem - (uint64_t)umem_s > vm->uphy_mem_size) {
+	    fatal("Functions need more memory than allocated\n");
 	}
 	fini_elf64_file(&elf);
     }
@@ -614,7 +648,7 @@ int setup_usercode(struct vm *vm)
 
       output repr:
       4  // num_nodes
-      0  // 0 in count
+      0  // 0 in count dag[] starts here
       1  // 1 in count
       1  // 2 in count
       2  // 3 in count
@@ -636,7 +670,14 @@ int setup_usercode(struct vm *vm)
         \   /
           2
     */
-    vm->metadata->num_nodes = ARR_SZ_1D(u_executable);
+    vm->metadata->num_nodes = 5;
+    {
+	uint16_t tmp_arr[] = {
+	    0,1,1,2,1,0,2,4,5,5,5,1,2,3,4,3,
+	};
+	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
+    }
+    /*
     vm->metadata->dag[0] = 0; // in nodes 0
     vm->metadata->dag[1] = 1; // in nodes 1
     vm->metadata->dag[2] = 1; // in nodes 2
@@ -651,6 +692,7 @@ int setup_usercode(struct vm *vm)
     vm->metadata->dag[11] = 3; // out 1
     vm->metadata->dag[12] = 3; // out 2
     vm->metadata->dag[13] = 0; // out 3
+    */
     memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
     vm->metadata->start_func = 0;
     sem_post(&sem_usercode_loaded);
