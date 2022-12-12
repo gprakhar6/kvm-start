@@ -38,6 +38,7 @@
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
 #define pdt() printf("dt = %ld us\n", dt(t2,t1));
+#define pts(ts) printf("ts = %ld us\n", (ts.tv_sec*1000000 + ts.tv_usec));
 typedef struct
 {
     int vcpufd;
@@ -48,15 +49,17 @@ typedef struct
     struct kvm_sregs sregs;
     struct kvm_regs regs;
     struct kvm_debugregs dregs;
-    struct kvm_cpuid2 *cpuid2;    
+    struct kvm_cpuid2 *cpuid2;
     uint64_t entry;
     uint64_t stack_start;
+    uint8_t *shared_mem;
     sem_t *sem_vcpu_init;
 } t_vcpu;
 
 struct vm {
     int fd;
     int ncpu;
+    int slot_no;
     t_vcpu *vcpu;
     uint64_t entry;
     uint64_t stack_start;
@@ -79,17 +82,19 @@ sem_t sem_booted, sem_usercode_loaded;
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
+void register_kmem(struct vm *vm);
 void setup_vcpus(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
 int setup_bootcode(struct vm *vm);
+void snapshot_vm(struct vm *vm);
 int setup_usercode(struct vm *vm);
+void register_umem(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(t_vcpu *vm);
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
-uint8_t report[256] = {0};
 
 static inline uint64_t tsc()
 {
@@ -121,42 +126,39 @@ int main(int argc, char *argv[])
 	ts(t1);
 	if(fork() != 0) {
 	    wait(&ret);
-	    ts(t2);
-	    pdt();
+	    pts(t1);
+	    //ts(t2);
+	    //pdt();
 	    exit(-1);
 	}
     }
-    
-    ts(t1);
-    get_vm(&vm); // 500 us
-    
     setup_guest_phy2_host_virt_map(&vm); // 50 us
     setup_bootcode(&vm); // 750 us
-    vm.ncpu = 4;
-
-    setup_vcpus(&vm); // 200 us
+    setup_usercode(&vm); // 290 us
+    get_vm(&vm); // 500 us    
+    register_kmem(&vm);
+    vm.ncpu = 1;    
+    setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
+    register_umem(&vm);
+    sem_post(&sem_usercode_loaded);    
+    //snapshot_vm(&vm);
     //setup_irqfd(&vm, 1);
     //setup_device_loop(&vm); // start device thread
 
     //pthread_join(vm.tid_tmr, NULL);
     //printf("Timer thread joined\n");
-    setup_usercode(&vm); // 290 us
+
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
     printf("All cpu thread joined\n");
 
-    for(i = 0; i < vm.ncpu; i++)
-	if(report[i] == 0) {
-	    printf("%d did not report\n", i);
-	}
-    
     return 0;
 }
 int decode_msg(t_vcpu *vcpu, uint16_t msg)
 {
     int i;
     int ret = 0;
-    
+
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
 	for(i = 1; i < vcpu->pool_size; i++)
@@ -167,15 +169,18 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//tsc_t2 = tsc();
 	//printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);
 	sem_post(&sem_booted);
-	sem_wait(&sem_usercode_loaded);
+	// TBD required or not? seems not
+	//sem_wait(&sem_usercode_loaded);
 	break;
 
     case 3: // MSG_WAITING_FOR_WORK
-	t1 = t2;
-	ts(t2);
-	pdt();
+	//t1 = t2;
+	//ts(t2);
+	//pts(t2);
+	//pdt();
+	//exit(-1);
 	printf("Waiting for work\n");
-	//exit(-1);	
+	printf("smem = %d\n", *(int *)vcpu->shared_mem);
 	break;
     default:
 	fatal("Unknown msg from the guest");
@@ -189,7 +194,7 @@ static inline int handle_io_port(t_vcpu *vcpu)
 {
     char c;
     int ret;
-    
+
     switch(vcpu->run->io.port) {
     case PORT_SERIAL: /* for the printf function */
 	if (vcpu->run->io.direction == KVM_EXIT_IO_OUT &&
@@ -227,11 +232,10 @@ static inline int handle_io_port(t_vcpu *vcpu)
 	    // out direction
 	    if (vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
 		v = *(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset);
-		report[v] = 1;
-	    }	    
+	    }
 	}
 	break;
-	
+
     case PORT_MSG: // 0x3fe-0x3ff
 	if(vcpu->run->io.direction == KVM_EXIT_IO_OUT) {
 	    if (vcpu->run->io.size == 2 && vcpu->run->io.count == 1) {
@@ -240,7 +244,7 @@ static inline int handle_io_port(t_vcpu *vcpu)
 		ret = decode_msg(vcpu, msg);
 	    }
 	}
-	break;	
+	break;
     default:
 	print_regs(vcpu);
 	fatal("unhandled KVM_EXIT_IO, %X\n", vcpu->run->io.port);
@@ -265,19 +269,6 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
     //mlock(vm->kmem, vm->kphy_mem_size);
     // TBD hopefully zero at init, cant have state machine with junk state
     vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);
-    // set up memory mapping
-    {
-	struct kvm_userspace_memory_region region = {
-	    .slot = 0,
-	    .flags = 0,
-	    .guest_phys_addr = 0,
-	    .memory_size = vm->kphy_mem_size,
-	    .userspace_addr = (size_t) vm->kmem
-	};
-	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)");
-	}
-    }
 
     return err;
 }
@@ -286,6 +277,7 @@ int get_vm(struct vm *vm)
 {
     int kvm, ret;
     int err, nent;
+
 
     err = 0;
     kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
@@ -298,10 +290,10 @@ int get_vm(struct vm *vm)
     if(ret == -1)
 	fatal("API error\n");
 
+
     vm->fd = ioctl(kvm, KVM_CREATE_VM, (unsigned long)0);
     if(vm->fd == -1)
 	fatal("cant create VM\n");
-
     ret = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, NULL);
     if(ret == -1)
 	fatal("kvm mmap size error\n");
@@ -317,19 +309,18 @@ int get_vm(struct vm *vm)
     vm->cpuid2->nent = nent;
     if(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, vm->cpuid2) < 0)
 	fatal("cant get cpuid");
-
     // all future vcpus will now have irqchip
     //print_cpuid_output(vm->cpuid2);
-#ifdef __IRQCHIP__    
+#ifdef __IRQCHIP__
     if(ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0))
 	fatal("Unable to create IRQCHIP\n");
 #endif
     // not sure about its correctness
-    ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
+    //ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_VCPUS);
     //printf("nr_vcpus = %d\n", ret);
-    ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS);
+    //ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS);
     //printf("max_vcpus = %d\n", ret);
-    ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS);
+    //ret = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS);
     //printf("max_memslots = %d\n", ret);
 
     sem_init(&sem_booted, 0, 0);
@@ -337,7 +328,22 @@ int get_vm(struct vm *vm)
 
     vm->metadata->bit_map_inactive_cpus = ~0;
     vm->metadata->num_active_cpus = 0;
+    vm->slot_no = 0;
     return err;
+}
+
+void register_kmem(struct vm *vm)
+{
+    struct kvm_userspace_memory_region region = {
+	.slot = vm->slot_no++,
+	.flags = 0,
+	.guest_phys_addr = 0,
+	.memory_size = vm->kphy_mem_size,
+	.userspace_addr = (size_t) vm->kmem
+    };
+    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)");
+    }    
 }
 
 void *create_vcpu(void *vvcpu)
@@ -346,17 +352,18 @@ void *create_vcpu(void *vvcpu)
     int ret;
     struct kvm_lapic_state lapic_state;
     struct kvm_mp_state mp_state;
-    
+
+    //ts(t1);
 #ifdef __IRQCHIP__
     if(ioctl(vcpu->vcpufd, KVM_GET_LAPIC, &lapic_state)) {
 	fatal("Could not get the lapic state");
     }
-#endif    
+#endif
     //print_lapic_state(&lapic_state);
     mp_state.mp_state = 1;
     sem_wait(vcpu->sem_vcpu_init);
     while(mp_state.mp_state != 0) {
-	
+
 	//while(0 && (vcpu->id != 0)) {
 	if(ioctl(vcpu->vcpufd, KVM_GET_MP_STATE, &mp_state)) {
 	    fatal("Cannot fetch MP_STATE");
@@ -364,10 +371,10 @@ void *create_vcpu(void *vvcpu)
 	//printf("MP_STATE for %d = %d\n", vcpu->id, mp_state.mp_state);
 	//sleep(1);
     }
-    
+
     //printf("In vcpu thread %ld\n", vcpu->tid);
     if(ioctl(vcpu->vcpufd, KVM_SET_CPUID2, vcpu->cpuid2) < 0)
-	fatal("cannot set cpuid things\n");    
+	fatal("cannot set cpuid things\n");
     // to get the real mode running
     if(ioctl(vcpu->vcpufd, KVM_GET_SREGS, &(vcpu->sregs)) < 0)
 	fatal("cant set get sregs tid = %ld\n", vcpu->tid);
@@ -386,7 +393,7 @@ void *create_vcpu(void *vvcpu)
 	    .rbx = 2,
 	    .rcx = (uint64_t)vcpu->id, // saves a vm exit, used in real mode
 	    .rsp = vcpu->stack_start,
-	    .rdi = vcpu->stack_start,	    
+	    .rdi = vcpu->stack_start,
 	    .rsi = 0,
 	    .rflags = 0x2,
 	    .r10 = (uint64_t)vcpu->id, // saves a vm exit
@@ -402,12 +409,14 @@ void *create_vcpu(void *vvcpu)
     //printf("before run vcpu %ld\n", vcpu->tid);
     //tsc_t1 = tsc();
     //ts(t1);
+    //ts(t2);
+    //pdt();
     while(1) {
 	ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
 	if(ret == -1)
 	    fatal("KVM_RUN ERROR\n");
 
-	//printf("exit reason = %d\n", vm.run->exit_reason);
+	//printf("exit reason = %d\n", vcpu->run->exit_reason);
 	//print_regs(&vm);
 	switch(vcpu->run->exit_reason) {
 	case KVM_EXIT_HLT:
@@ -428,6 +437,7 @@ void *create_vcpu(void *vvcpu)
 	    fatal("KVM_EXIT_FAIL_ENTRY\n");
 	    break;
 	default:
+	    print_regs(vcpu);
 	    fatal("exit_reason = %d\n, exiting\n", vcpu->run->exit_reason);
 	    break;
 	}
@@ -467,8 +477,8 @@ void setup_vcpus(struct vm *vm)
 	// more than one page.
 	vm->vcpu[i].stack_start = vm->stack_start - ((i) * PAGE_SIZE);
 	vm->vcpu[i].pool_size = vm->ncpu;
+	vm->vcpu[i].shared_mem = vm->umem;
     }
-
     start_id = 0;
     // start all the vcpu threads
     for(i = 0; i < vm->ncpu; i++) {
@@ -484,8 +494,8 @@ void setup_vcpus(struct vm *vm)
 	}
     }
     // only after all vcpus are created
-    sem_post(&sem_vcpu_init[0]); // make sure cpu id zero starts    
-    
+    sem_post(&sem_vcpu_init[0]); // make sure cpu id zero starts
+
 }
 
 const char limit_file[] = "../elf-reader/limits.txt";
@@ -497,7 +507,7 @@ int setup_bootcode(struct vm *vm)
     void *saddr;
     Elf64_Addr daddr;
     struct elf64_file elf;
-    Elf64_Shdr* shdr;    
+    Elf64_Shdr* shdr;
     // to make all vcpu wait at barrier
     sem_init(&vcpu_init_barrier, 0, 0);
 
@@ -508,10 +518,11 @@ int setup_bootcode(struct vm *vm)
 	daddr = elf.prog_regions[i]->vaddr;
 	saddr = elf.prog_regions[i]->addr;
 	sz = elf.prog_regions[i]->filesz;
-	memcpy(&vm->kmem[daddr], saddr, sz);
+	memcpy(&(vm->kmem[daddr]), saddr, sz);
+	printf("vaddr = %08lX saddr = %08lX\n",(uint64_t)daddr, (uint64_t)saddr);
     }
 
-    vm->entry = elf.ehdr.e_entry;
+    vm->entry = elf.ehdr->e_entry;
     shdr = get_shdr(&elf, ".stack");
     if(shdr == NULL)
 	fatal("no stack section found for boot\n");
@@ -528,6 +539,10 @@ int setup_bootcode(struct vm *vm)
 	sem_post(&vcpu_init_barrier);
 
     return 0;
+}
+
+void snapshot_vm(struct vm *vm)
+{
 }
 
 int setup_usercode(struct vm *vm)
@@ -554,34 +569,22 @@ int setup_usercode(struct vm *vm)
     uint64_t *upt;
     uint64_t ptidx, hudiff;
     Elf64_Shdr* shdr;
-    
+
     //sem_wait(&sem_booted);
 
     // TBD proper allocation of phy memory
     vm->uphy_mem_size = 2 * _MB + 2 * _MB * ARR_SZ_1D(u_executable);
     vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
 		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
-    
+
     // should check MAP_FAILED TBD
     if(!vm->umem)
 	fatal("cant mmap\n");
-    {
-	struct kvm_userspace_memory_region region = {
-	    .slot = 1,
-	    .flags = 0,
-	    .guest_phys_addr = vm->kphy_mem_size,
-	    .memory_size = vm->uphy_mem_size,
-	    .userspace_addr = (size_t) vm->umem
-	};
-	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
-	}	
-    }
-    
+
     //printf("slot 1 userspace now has memory\n");
     //return;
     //printf("Creating usercode\n");
-    strncat(cmd, u_object_file, sizeof(cmd)-1);
+    //strncat(cmd, u_object_file, sizeof(cmd)-1);
     //printf("executing cmd: %s\n",cmd);
     /*
       if(system(cmd))
@@ -590,7 +593,7 @@ int setup_usercode(struct vm *vm)
     init_limits(limit_file);
     smem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
     umem = (uint8_t *)((uint64_t)vm->kphy_mem_size + 2 * _MB);
-    umem_s = umem;
+    umem_s = umem;	
     hmem = (uint8_t *)((uint64_t)(vm->umem) + 2 * _MB); // host virt addr
     kmem = vm->kern_end; // guest physical addr
     hudiff = (uint64_t)hmem - (uint64_t)umem;
@@ -600,12 +603,12 @@ int setup_usercode(struct vm *vm)
 	init_elf64_file(&u_executable[j][0], &elf);
 	memset(upt, 0, 512 * 8); // page table zeroing TBD, probably already zero
 	upt[0] = ((uint64_t)smem & (~PAGE_MASK)) |	\
-	    0x087; // big,X,X,X,X,user,writable,present	
+	    0x087; // big,X,X,X,X,user,writable,present
 	vm->metadata->func_info[j].pt_addr = kmem;
 	shdr = get_shdr(&elf, ".stack");
 	vm->metadata->func_info[j].stack_load_addr = \
 	    shdr->sh_addr + shdr->sh_size;
-	vm->metadata->func_info[j].entry_addr = elf.ehdr.e_entry;
+	vm->metadata->func_info[j].entry_addr = elf.ehdr->e_entry;
 	for(i = 0; i < elf.num_regions; i++) {
 	    vaddr = elf.prog_regions[i]->vaddr;
 	    saddr = elf.prog_regions[i]->addr;
@@ -656,11 +659,11 @@ int setup_usercode(struct vm *vm)
       1  // 1 in count
       1  // 2 in count
       2  // 3 in count
-      0  // 0 start_idx 
-      2  // 1 start_idx 
-      3  // 2 start_idx 
+      0  // 0 start_idx
+      2  // 1 start_idx
+      3  // 2 start_idx
       4  // 3 start_idx  (no out edge so same idxes)
-      4  // 3 end_idx 
+      4  // 3 end_idx
       1  // out_edge 0
       2
       3  // out_edge 1
@@ -699,8 +702,23 @@ int setup_usercode(struct vm *vm)
     */
     memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
     vm->metadata->start_func = 0;
-    sem_post(&sem_usercode_loaded);
     //printf("Completed user code creation\n");
+
+}
+
+// call after copying user data
+void register_umem(struct vm *vm)
+{
+    struct kvm_userspace_memory_region region = {
+	.slot = vm->slot_no++,
+	.flags = 0,
+	.guest_phys_addr = vm->kphy_mem_size,
+	.memory_size = vm->uphy_mem_size,
+	.userspace_addr = (size_t) vm->umem
+    };
+    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+    }
 }
 
 void* timer_event_loop(void *vvm)
@@ -843,8 +861,8 @@ Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name)
 {
     int i;
     Elf64_Shdr *ret = NULL;
-    
-    for(i = 0; i < elf->ehdr.e_shnum; i++) {
+
+    for(i = 0; i < elf->ehdr->e_shnum; i++) {
 	int idx;
 	idx = elf->shdr[i].sh_name;
 	if(strcmp(&(elf->shstrtbl[idx]), name) == 0) {
