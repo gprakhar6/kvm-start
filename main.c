@@ -76,6 +76,7 @@ struct vm {
     int slot_no;
     t_vcpu *vcpu;
     uint64_t entry;
+    struct func_prop kprop;
     uint64_t stack_start;
     uint64_t kern_end;
     struct kvm_cpuid2 *cpuid2;
@@ -105,6 +106,7 @@ void register_kmem(struct vm *vm);
 void setup_vcpus(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
 int setup_bootcode(struct vm *vm);
+int setup_bootcode_mmap(struct vm *vm);
 void snapshot_vm(struct vm *vm);
 int setup_usercode(struct vm *vm);
 int setup_usercode_mmap(struct vm *vm);
@@ -153,8 +155,9 @@ int main(int argc, char *argv[])
 	    exit(-1);
 	}
     }
-    setup_guest_phy2_host_virt_map(&vm); // 50 us
-    setup_bootcode(&vm); // 750 us
+    //setup_guest_phy2_host_virt_map(&vm); // 50 us
+    //setup_bootcode(&vm); // 750 us
+    setup_bootcode_mmap(&vm); // 750 us
     //setup_usercode(&vm); // 290 us
     setup_usercode_mmap(&vm); // 290 us
     get_vm(&vm); // 500 us    
@@ -563,6 +566,38 @@ int setup_bootcode(struct vm *vm)
 	sem_post(&vcpu_init_barrier);
 
     return 0;
+}
+
+int setup_bootcode_mmap(struct vm *vm)
+{
+    int fd; struct stat stat;
+    const char kernel_code[1024] = "../boot/bin/main_mapped";
+    const char kernel_prop[1024] = "../boot/bin/main_mapped_prop";
+    FILE *fp;
+    fd = open(kernel_code, O_RDWR);
+    if(fd == -1)
+	fatal("Unable to open kernel code\n");
+    fstat(fd, &stat);
+    vm->kmem = mmap(NULL, stat.st_size, PROT_READ | PROT_WRITE, \
+		    MAP_PRIVATE, fd, 0);
+    close(fd);
+    vm->kphy_mem_size = stat.st_size;
+    if(vm->kmem == MAP_FAILED)
+	fatal("mmap of kernel code failed\n");
+
+    fp = fopen(kernel_prop, "r");
+    if(fp == NULL)
+	fatal("unable to open kernel code properties\n");
+
+    fread(&(vm->kprop), sizeof(vm->kprop), 1, fp);
+    fclose(fp);
+
+    
+    vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);    
+    // TBD Compatibility
+    vm->entry = vm->kprop.entry;
+    vm->stack_start = vm->kprop.stack_load_addr;
+    vm->kern_end = MB_1; // TBD putting hard limit
 }
 
 void snapshot_vm(struct vm *vm)
