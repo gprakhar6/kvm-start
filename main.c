@@ -16,6 +16,7 @@
 #include <sys/eventfd.h>
 #include <semaphore.h>
 #include <elf.h>
+#include <sys/stat.h>
 #include "globvar.h"
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
@@ -29,11 +30,19 @@
 	exit(1);					\
     } while(0)
 
-#define _MB       (1024 * 1024)
+#define KB_1 (1024)
+#define KB_4 (4 * 1024)
+#define MB_1 (1024 * KB_1)
+#define MB_2 (2 * MB_1)
+#define MB_512 (512 * MB_1)
+
 #define ONE_PAGE (0x1000)
 #define GUEST_MEMORY (4 * 1024 * 1024)
 #define PAGE_MASK (0x1FFFFF)
 
+#define SZ2PAGES(x) (((x) + MB_2 - 1) / MB_2)
+#define ROUND2PAGE(x) (SZ2PAGES(x) * MB_2)
+#define H2G(h,g) ((h) + (uint64_t)&(g))
 #define ARR_SZ_1D(x) (sizeof(x)/sizeof(x[0]))
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
@@ -52,9 +61,14 @@ typedef struct
     struct kvm_cpuid2 *cpuid2;
     uint64_t entry;
     uint64_t stack_start;
-    uint8_t *shared_mem;
+    uint8_t **shared_mem;
     sem_t *sem_vcpu_init;
 } t_vcpu;
+
+struct func_prop {
+    uint64_t entry;
+    uint64_t stack_load_addr;
+};
 
 struct vm {
     int fd;
@@ -72,6 +86,11 @@ struct vm {
     unsigned int uphy_mem_size;
     pthread_t tid_tmr, tid_ucc;
     int tmr_eventfd;
+    uint8_t *shared_mem;
+    int num_mm;
+    void *mm[MAX_FUNC];
+    int mm_size[MAX_FUNC];
+    struct func_prop func_prop[MAX_FUNC];
     struct t_metadata *metadata;
 };
 
@@ -88,7 +107,9 @@ int setup_guest_phy2_host_virt_map(struct vm *vm);
 int setup_bootcode(struct vm *vm);
 void snapshot_vm(struct vm *vm);
 int setup_usercode(struct vm *vm);
+int setup_usercode_mmap(struct vm *vm);
 void register_umem(struct vm *vm);
+void register_umem_mmap(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(t_vcpu *vm);
@@ -134,12 +155,14 @@ int main(int argc, char *argv[])
     }
     setup_guest_phy2_host_virt_map(&vm); // 50 us
     setup_bootcode(&vm); // 750 us
-    setup_usercode(&vm); // 290 us
+    //setup_usercode(&vm); // 290 us
+    setup_usercode_mmap(&vm); // 290 us
     get_vm(&vm); // 500 us    
     register_kmem(&vm);
     vm.ncpu = 1;    
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
-    register_umem(&vm);
+    //register_umem(&vm);
+    register_umem_mmap(&vm);
     sem_post(&sem_usercode_loaded);    
     //snapshot_vm(&vm);
     //setup_irqfd(&vm, 1);
@@ -180,7 +203,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//pdt();
 	//exit(-1);
 	printf("Waiting for work\n");
-	printf("smem = %d\n", *(int *)vcpu->shared_mem);
+	printf("smem = %d\n", **(int **)vcpu->shared_mem);
 	break;
     default:
 	fatal("Unknown msg from the guest");
@@ -260,7 +283,7 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
     err = 0;
     vm->kphy_mem_size = GUEST_MEMORY;
     vm->kmem = mmap(NULL, vm->kphy_mem_size, PROT_READ | PROT_WRITE,
-		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
+		    MAP_PRIVATE | MAP_ANONYMOUS, -1 , 0);
 
     // should check MAP_FAILED TBD
     if(!vm->kmem)
@@ -456,7 +479,7 @@ void setup_vcpus(struct vm *vm)
     vm->vcpu = calloc(vm->ncpu, sizeof(*(vm->vcpu)));
     if(vm->vcpu == NULL)
 	fatal("Cannot allocate vm->vcpu");
-
+    
     for(i = 0; i < vm->ncpu; i++) {
 	vcpu_id = i;
 	vm->vcpu[i].vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, vcpu_id);
@@ -464,8 +487,9 @@ void setup_vcpus(struct vm *vm)
 	if(vm->vcpu[i].vcpufd == -1)
 	    fatal("Cannot create vcpu\n");
 
-	vm->vcpu[i].run = mmap(NULL, vm->mmap_size, PROT_READ | PROT_WRITE,
-			       MAP_SHARED, vm->vcpu[i].vcpufd, 0);
+	vm->vcpu[i].run = \
+	    mmap(NULL, vm->mmap_size, PROT_READ | PROT_WRITE,
+		 MAP_SHARED, vm->vcpu[i].vcpufd, 0);
 	if(!vm->vcpu[i].run)
 	    fatal("run error\n");
 
@@ -477,7 +501,7 @@ void setup_vcpus(struct vm *vm)
 	// more than one page.
 	vm->vcpu[i].stack_start = vm->stack_start - ((i) * PAGE_SIZE);
 	vm->vcpu[i].pool_size = vm->ncpu;
-	vm->vcpu[i].shared_mem = vm->umem;
+	vm->vcpu[i].shared_mem = &(vm->shared_mem);
     }
     start_id = 0;
     // start all the vcpu threads
@@ -569,13 +593,12 @@ int setup_usercode(struct vm *vm)
     uint64_t *upt;
     uint64_t ptidx, hudiff;
     Elf64_Shdr* shdr;
-
     //sem_wait(&sem_booted);
 
     // TBD proper allocation of phy memory
-    vm->uphy_mem_size = 2 * _MB + 2 * _MB * ARR_SZ_1D(u_executable);
+    vm->uphy_mem_size = MB_2 + MB_2 * ARR_SZ_1D(u_executable);
     vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
-		    MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
+		    MAP_PRIVATE | MAP_ANONYMOUS, -1 , 0);
 
     // should check MAP_FAILED TBD
     if(!vm->umem)
@@ -592,9 +615,10 @@ int setup_usercode(struct vm *vm)
     */
     init_limits(limit_file);
     smem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
-    umem = (uint8_t *)((uint64_t)vm->kphy_mem_size + 2 * _MB);
+    umem = (uint8_t *)((uint64_t)vm->kphy_mem_size + MB_2);
+    vm->shared_mem = vm->umem;
     umem_s = umem;	
-    hmem = (uint8_t *)((uint64_t)(vm->umem) + 2 * _MB); // host virt addr
+    hmem = (uint8_t *)((uint64_t)(vm->umem) + MB_2); // host virt addr
     kmem = vm->kern_end; // guest physical addr
     hudiff = (uint64_t)hmem - (uint64_t)umem;
     for(j = 0; j < ARR_SZ_1D(u_executable); j++) {
@@ -618,7 +642,7 @@ int setup_usercode(struct vm *vm)
 		//printf("ptidx = %ld\n", ptidx);
 		upt[ptidx] = ((uint64_t)umem & (~PAGE_MASK)) |	\
 		    0x087; // big,X,X,X,X,user,writable,present
-		umem = (typeof(umem))((uint64_t)umem + 2 * _MB);
+		umem = (typeof(umem))((uint64_t)umem + MB_2);
 		//printf("Increased umem\n");
 	    }
 	    daddr = (Elf64_Addr)(((upt[ptidx] & (~PAGE_MASK)) |		\
@@ -633,7 +657,7 @@ int setup_usercode(struct vm *vm)
 	    memcpy((void *)daddr, saddr, fsz);
 	}
 	kmem += 512*8;
-	if(kmem > (2 * _MB)) {
+	if(kmem > (MB_2)) {
 	    fatal("Crossed kernel 2MB for page tables");
 	}
 	if((uint64_t)umem - (uint64_t)umem_s > vm->uphy_mem_size) {
@@ -706,6 +730,54 @@ int setup_usercode(struct vm *vm)
 
 }
 
+int setup_usercode_mmap(struct vm *vm)
+{
+    int i, j, num_pages;
+    uint64_t gp_pt; // guest physical, page table start for funcs
+    const char u_executable[][128] = {
+	"tmp/func0_mapped",
+	"tmp/func0_mapped",
+	"tmp/func0_mapped",
+	"tmp/func0_mapped",
+	"tmp/func0_mapped",
+    };
+    char u_executable_prop[ARR_SZ_1D(u_executable)][128];
+    for(i = 0; i < ARR_SZ_1D(u_executable); i++) {
+	strcpy(&u_executable_prop[i][0], &u_executable[i][0]);
+	strcat(&u_executable_prop[i][0], "_prop");
+    }
+    
+    vm->shared_mem = \
+	(uint8_t *)mmap(NULL, MB_2, PROT_READ | PROT_WRITE, \
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(vm->shared_mem == MAP_FAILED)
+	fatal("shared mapping failed\n");
+    vm->num_mm = 0;
+    for(i = 0; i < ARR_SZ_1D(u_executable); i++) {
+	
+	int fd;
+	struct stat stat;
+	FILE *fp;
+	fd = open(&u_executable[i][0], O_RDWR);
+	if(fd == -1)
+	    fatal("unable to open %s\n", &u_executable[i][0]);
+	fp = fopen(&u_executable_prop[i][0], "r");
+	if(fp == NULL)
+	    fatal("cannot open %s\n", &u_executable_prop[i][0]);
+
+	fread(&vm->func_prop[i], sizeof(vm->func_prop[i]), 1, fp);
+	fstat(fd, &stat);
+	vm->mm[i] = (uint8_t *)mmap(NULL, stat.st_size, \
+				    PROT_READ | PROT_WRITE, \
+				    MAP_PRIVATE,fd, 0);
+	if(vm->mm[i] == MAP_FAILED)
+	    fatal("mmap of %s failed\n", &u_executable[i][0]);
+	close(fd);
+	fclose(fp);
+        vm->mm_size[i] = stat.st_size;
+	vm->num_mm++;
+    }
+}
 // call after copying user data
 void register_umem(struct vm *vm)
 {
@@ -719,6 +791,136 @@ void register_umem(struct vm *vm)
     if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
 	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
     }
+}
+
+// call after copying user data and kern data
+void register_umem_mmap(struct vm *vm)
+{
+    int i, j;
+    uint64_t *gp_pt; // guest physical page table
+    uint64_t gp_mem, gp_shm;
+    uint64_t hv_kmem;
+    gp_mem = vm->kphy_mem_size; // end of k pages
+    gp_pt = (uint64_t *)vm->kern_end;
+    hv_kmem = (uint64_t)vm->kmem;
+    // shared memory below kmem end page
+    {
+	struct kvm_userspace_memory_region region = {
+	    .slot = vm->slot_no++,
+	    .flags = 0,
+	    .guest_phys_addr = gp_mem,
+	    .memory_size = MB_2, // shm is 2mb
+	    .userspace_addr = (size_t) vm->shared_mem
+	};
+	printf("registering shared mem\n");
+	printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
+	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+	}
+	printf("registered shared mem\n");
+	gp_shm = region.guest_phys_addr;
+	gp_mem += region.memory_size;
+	gp_mem = ROUND2PAGE(gp_mem);
+    }
+
+    for(i = 0; i < vm->num_mm; i++) {
+	int num_pages;
+	uint64_t gp_area;
+	{
+	    struct kvm_userspace_memory_region region = {
+		.slot = vm->slot_no++,
+		.flags = 0,
+		.guest_phys_addr = gp_mem,
+		.memory_size = vm->mm_size[i],
+		.userspace_addr = (size_t) vm->mm[i]
+	    };
+	    printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
+	    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+		fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+	    }
+	    gp_area = region.guest_phys_addr;
+	    gp_mem += region.memory_size;
+	    gp_mem = ROUND2PAGE(gp_mem);
+	}
+	printf("%08lX\n", *(uint64_t *)vm->mm[i]);
+	vm->metadata->func_info[i].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
+	vm->metadata->func_info[i].stack_load_addr = \
+	    (typeof(vm->metadata->func_info[i].stack_load_addr))vm->func_prop[i].stack_load_addr;
+	vm->metadata->func_info[i].entry_addr \
+	    = (typeof(vm->metadata->func_info[i].entry_addr))vm->func_prop[i].entry;
+	
+	num_pages = SZ2PAGES(vm->mm_size[i]);
+	*(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
+	for(j = 1; j <= num_pages; j++) {
+	    *(uint64_t *)H2G(hv_kmem, gp_pt[j]) = gp_area | \
+		0x087; // big,X,X,X,X,user,writable,present
+	    printf("func %d:num_pages=%d:pt[%d] %08lX\n", i, num_pages, j, *(uint64_t *)H2G(hv_kmem, gp_pt[j]));
+		gp_area += MB_2;
+	}
+	gp_pt += 512; // one page table
+    }
+    /*
+      dag repr:
+      num_nodes
+      in_vertex_count_per_node
+      start_of_out_vertex_idxes
+
+          1
+        /   \
+       0     3
+        \   /
+          2
+
+      output repr:
+      4  // num_nodes
+      0  // 0 in count dag[] starts here
+      1  // 1 in count
+      1  // 2 in count
+      2  // 3 in count
+      0  // 0 start_idx
+      2  // 1 start_idx
+      3  // 2 start_idx
+      4  // 3 start_idx  (no out edge so same idxes)
+      4  // 3 end_idx
+      1  // out_edge 0
+      2
+      3  // out_edge 1
+      3  // out_edge 2
+     */
+
+    /*
+          1
+        /   \
+       0     3
+        \   /
+          2
+    */
+    vm->metadata->num_nodes = 5;
+    {
+	uint16_t tmp_arr[] = {
+	    0,1,1,2,1,0,2,4,5,5,5,1,2,3,4,3,
+	};
+	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
+    }
+    /*
+    vm->metadata->dag[0] = 0; // in nodes 0
+    vm->metadata->dag[1] = 1; // in nodes 1
+    vm->metadata->dag[2] = 1; // in nodes 2
+    vm->metadata->dag[3] = 2; // in nodes 3
+    vm->metadata->dag[4] = 0;
+    vm->metadata->dag[5] = 2;
+    vm->metadata->dag[6] = 3;
+    vm->metadata->dag[7] = 4;
+    vm->metadata->dag[8] = 4;
+    vm->metadata->dag[9] = 1; // out 0
+    vm->metadata->dag[10] = 2;
+    vm->metadata->dag[11] = 3; // out 1
+    vm->metadata->dag[12] = 3; // out 2
+    vm->metadata->dag[13] = 0; // out 3
+    */
+    memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
+    vm->metadata->start_func = 0;    
+    //exit(-1);
 }
 
 void* timer_event_loop(void *vvm)
@@ -855,22 +1057,4 @@ void print_lapic_state(struct kvm_lapic_state *lapic)
     int i;
     for(i = 0; i < 0x40; i++)
 	printf("[%03X] = %08X\n", i << 4, *(uint32_t *)&lapic->regs[i << 4]);
-}
-
-Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name)
-{
-    int i;
-    Elf64_Shdr *ret = NULL;
-
-    for(i = 0; i < elf->ehdr->e_shnum; i++) {
-	int idx;
-	idx = elf->shdr[i].sh_name;
-	if(strcmp(&(elf->shstrtbl[idx]), name) == 0) {
-	    //printf("idx = %d\n", i);
-	    ret = &(elf->shdr[i]);
-	    break;
-	}
-    }
-
-    return ret;
 }
