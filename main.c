@@ -17,10 +17,14 @@
 #include <semaphore.h>
 #include <elf.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "globvar.h"
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 #include "runtime_if.h"
+#include "sock_flow.h"
 
 #define __IRQCHIP__
 
@@ -62,6 +66,9 @@ typedef struct
     uint64_t entry;
     uint64_t stack_start;
     uint8_t **shared_mem;
+    int *clifd;
+    int *sock_f, *sockaddr_f_len, *buflen;
+    struct sockaddr *saddr_f;
     sem_t *sem_vcpu_init;
 } t_vcpu;
 
@@ -71,6 +78,7 @@ struct func_prop {
 };
 
 struct vm {
+    pid_t pid;
     int fd;
     int ncpu;
     int slot_no;
@@ -85,9 +93,12 @@ struct vm {
     unsigned int kphy_mem_size;
     uint8_t *umem;
     unsigned int uphy_mem_size;
-    pthread_t tid_tmr, tid_ucc;
+    pthread_t tid_tmr, tid_sock;
     int tmr_eventfd;
     uint8_t *shared_mem;
+    int clifd;
+    int sock_f, sockaddr_f_len;
+    struct sockaddr saddr_f;
     int num_mm;
     void *mm[MAX_FUNC];
     int mm_size[MAX_FUNC];
@@ -95,10 +106,11 @@ struct vm {
     struct t_metadata *metadata;
 };
 
+int pktcnt = 0;
 struct timeval t1, t2;
 uint64_t tsc_t1, tsc_t2;
 sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
-sem_t sem_booted, sem_usercode_loaded;
+sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
@@ -115,6 +127,7 @@ void register_umem_mmap(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
 int print_regs(t_vcpu *vm);
+void install_signal_handlers();
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
@@ -127,12 +140,15 @@ static inline uint64_t tsc()
     return rax;
 }
 
+struct vm vm;
 int main(int argc, char *argv[])
 {
     int i, ret;
     int time_the_fork = 0;
-    struct vm vm;
-
+    int sockfd, itrue, clifd, len;
+    struct sockaddr_in servaddr, cli;
+    int server_port = 9988, max_listen = 4;
+    char buf[128];
     switch(argc) {
     case 0:
     case 1:
@@ -160,20 +176,54 @@ int main(int argc, char *argv[])
     setup_bootcode_mmap(&vm); // 750 us
     //setup_usercode(&vm); // 290 us
     setup_usercode_mmap(&vm); // 290 us
+    
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(sockfd == -1)
+	fatal("Unable to get a socket");
+
+    itrue = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &itrue, sizeof(int));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(server_port);
+    if(bind(sockfd, (struct sockaddr *)&servaddr,
+            sizeof(servaddr)) != 0) {
+	fatal("Unable to bind the socket\n");
+    }
+    if(listen(sockfd, max_listen) != 0) {
+        fatal("listen failed\n");
+    }
+read_again:
+    clifd = accept(sockfd, (struct sockaddr *)&cli, &len);
+    len = 100;
+    while(read(clifd, buf, len) <= 0);
+    ts(t1);
+    if(fork() != 0) {
+	//close(clifd);
+	//while(1);
+	goto read_again;
+    }
+    else {
+	vm.pid = getpid();
+	printf("pid = %d\n", vm.pid);
+	close(sockfd);
+    }
+
     get_vm(&vm); // 500 us    
     register_kmem(&vm);
-    vm.ncpu = 1;    
+    vm.ncpu = 1;
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
     //register_umem(&vm);
     register_umem_mmap(&vm);
     sem_post(&sem_usercode_loaded);    
     //snapshot_vm(&vm);
     //setup_irqfd(&vm, 1);
-    //setup_device_loop(&vm); // start device thread
+    setup_device_loop(&vm); // start device thread
 
     //pthread_join(vm.tid_tmr, NULL);
     //printf("Timer thread joined\n");
 
+    install_signal_handlers();
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
     printf("All cpu thread joined\n");
@@ -183,8 +233,9 @@ int main(int argc, char *argv[])
 int decode_msg(t_vcpu *vcpu, uint16_t msg)
 {
     int i;
-    int ret = 0;
-
+    int ret = 0, len;
+    char buf[128], buflen;
+    
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
 	for(i = 1; i < vcpu->pool_size; i++)
@@ -196,17 +247,40 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);
 	sem_post(&sem_booted);
 	// TBD required or not? seems not
-	//sem_wait(&sem_usercode_loaded);
+	sem_wait(&sem_usercode_loaded);
 	break;
 
     case 3: // MSG_WAITING_FOR_WORK
-	//t1 = t2;
-	//ts(t2);
 	//pts(t2);
-	//pdt();
+	if(pktcnt == 0) {
+	    printf("private_clean + private_dirty + private_hugetlb:\n");
+	    system("cat /proc/self/smaps  | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'");
+	    printf("pss:\n");
+	    system("cat /proc/self/smaps | grep -i '^pss' | awk '//{s+=$2}END{print s}'");
+	    ts(t1);
+	}
+	buflen = 60;
+	if((buflen = recvfrom(*(vcpu->sock_f), *(vcpu->shared_mem), buflen,
+			      0, vcpu->saddr_f, (socklen_t *)vcpu->sockaddr_f_len)) <= 0)
+	    fatal("bad buflen\n");
+	if(buflen != 60)
+	    printf("bad buflen\n");
+	//sem_post(&sem_work_fin);
+	//sem_wait(&sem_work_wait);
 	//exit(-1);
-	printf("Waiting for work\n");
-	printf("smem = %d\n", **(int **)vcpu->shared_mem);
+	//printf("Waiting for work\n");
+	
+	pktcnt++;
+	//printf("%d: %d\n",buflen,pktcnt);
+	if(pktcnt >= 1000000) {
+	    ts(t2);
+	    pdt();
+	    exit(-1);
+	}
+	/*
+	if(pktcnt % 1000 == 0)
+	    printf("%d:smem = %08X,cnt=%d\n", vcpu->id, **(uint32_t **)vcpu->shared_mem, pktcnt);
+	*/
 	break;
     default:
 	fatal("Unknown msg from the guest");
@@ -299,12 +373,28 @@ int setup_guest_phy2_host_virt_map(struct vm *vm)
     return err;
 }
 
+static struct sock_filter code[] = {
+{ 0x28, 0, 0, 0x0000000c },
+{ 0x15, 0, 4, 0x00000800 },
+{ 0x20, 0, 0, 0x0000001a },
+{ 0x15, 8, 0, 0x0a1046f0 },
+{ 0x20, 0, 0, 0x0000001e },
+{ 0x15, 6, 7, 0x0a1046f0 },
+{ 0x15, 1, 0, 0x00000806 },
+{ 0x15, 0, 5, 0x00008035 },
+{ 0x20, 0, 0, 0x0000001c },
+{ 0x15, 2, 0, 0x0a1046f0 },
+{ 0x20, 0, 0, 0x00000026 },
+{ 0x15, 0, 1, 0x0a1046f0 },
+{ 0x6, 0, 0, 0x00040000 },
+{ 0x6, 0, 0, 0x00000000 },
+};
+
 int get_vm(struct vm *vm)
 {
     int kvm, ret;
     int err, nent;
-
-
+    
     err = 0;
     kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if(kvm == -1) {
@@ -351,7 +441,15 @@ int get_vm(struct vm *vm)
 
     sem_init(&sem_booted, 0, 0);
     sem_init(&sem_usercode_loaded, 0, 0);
+    sem_init(&sem_work_wait, 0, 0);
+    sem_init(&sem_work_fin, 0, 0);
 
+    vm->sock_f = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
+    if(vm->sock_f < 0)
+	fatal("cannot create sock for the flow\n");
+    vm->sockaddr_f_len = sizeof(vm->saddr_f);
+    printf("sock listening on br0\n");    
+    
     vm->metadata->bit_map_inactive_cpus = ~0;
     vm->metadata->num_active_cpus = 0;
     vm->slot_no = 0;
@@ -505,6 +603,10 @@ void setup_vcpus(struct vm *vm)
 	vm->vcpu[i].stack_start = vm->stack_start - ((i) * PAGE_SIZE);
 	vm->vcpu[i].pool_size = vm->ncpu;
 	vm->vcpu[i].shared_mem = &(vm->shared_mem);
+	vm->vcpu[i].clifd = &(vm->clifd);
+	vm->vcpu[i].sock_f = &(vm->sock_f);
+	vm->vcpu[i].saddr_f = &(vm->saddr_f);
+	vm->vcpu[i].sockaddr_f_len = &(vm->sockaddr_f_len);
     }
     start_id = 0;
     // start all the vcpu threads
@@ -736,11 +838,16 @@ int setup_usercode(struct vm *vm)
         \   /
           2
     */
-    vm->metadata->num_nodes = 5;
+    vm->metadata->num_nodes = 2;
     {
+	/*
 	uint16_t tmp_arr[] = {
 	    0,1,1,2,1,0,2,4,5,5,5,1,2,3,4,3,
 	};
+	*/
+	uint16_t tmp_arr[] = {
+	    0,1,0,1,1,1,
+	};	
 	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
     }
     /*
@@ -769,14 +876,12 @@ int setup_usercode_mmap(struct vm *vm)
 {
     int i, j, num_pages;
     uint64_t gp_pt; // guest physical, page table start for funcs
-    const char u_executable[][128] = {
-	"tmp/func0_mapped",
-	"tmp/func0_mapped",
-	"tmp/func0_mapped",
-	"tmp/func0_mapped",
-	"tmp/func0_mapped",
+    const char u_executable[][1024] = {
+	"/home/prakhar/data/code/nfvs/firewall/main_mapped",
+	"/home/prakhar/data/code/nfvs/ids/main_mapped",
+	"/home/prakhar/data/code/nfvs/encrypt/main_mapped",
     };
-    char u_executable_prop[ARR_SZ_1D(u_executable)][128];
+    char u_executable_prop[ARR_SZ_1D(u_executable)][1024];
     for(i = 0; i < ARR_SZ_1D(u_executable); i++) {
 	strcpy(&u_executable_prop[i][0], &u_executable[i][0]);
 	strcat(&u_executable_prop[i][0], "_prop");
@@ -847,12 +952,12 @@ void register_umem_mmap(struct vm *vm)
 	    .memory_size = MB_2, // shm is 2mb
 	    .userspace_addr = (size_t) vm->shared_mem
 	};
-	printf("registering shared mem\n");
-	printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
+	//printf("registering shared mem\n");
+	//printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
 	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
 	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
 	}
-	printf("registered shared mem\n");
+	//printf("registered shared mem\n");
 	gp_shm = region.guest_phys_addr;
 	gp_mem += region.memory_size;
 	gp_mem = ROUND2PAGE(gp_mem);
@@ -869,7 +974,7 @@ void register_umem_mmap(struct vm *vm)
 		.memory_size = vm->mm_size[i],
 		.userspace_addr = (size_t) vm->mm[i]
 	    };
-	    printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
+	    //printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
 	    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
 		fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
 	    }
@@ -877,7 +982,7 @@ void register_umem_mmap(struct vm *vm)
 	    gp_mem += region.memory_size;
 	    gp_mem = ROUND2PAGE(gp_mem);
 	}
-	printf("%08lX\n", *(uint64_t *)vm->mm[i]);
+	//printf("%08lX\n", *(uint64_t *)vm->mm[i]);
 	vm->metadata->func_info[i].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
 	vm->metadata->func_info[i].stack_load_addr = \
 	    (typeof(vm->metadata->func_info[i].stack_load_addr))vm->func_prop[i].stack_load_addr;
@@ -889,8 +994,9 @@ void register_umem_mmap(struct vm *vm)
 	for(j = 1; j <= num_pages; j++) {
 	    *(uint64_t *)H2G(hv_kmem, gp_pt[j]) = gp_area | \
 		0x087; // big,X,X,X,X,user,writable,present
-	    printf("func %d:num_pages=%d:pt[%d] %08lX\n", i, num_pages, j, *(uint64_t *)H2G(hv_kmem, gp_pt[j]));
-		gp_area += MB_2;
+	    //printf("func %d:num_pages=%d:pt[%d] %08lX\n", i, num_pages, j, *(uint64_t *)H2G(hv_kmem, gp_pt[j]));
+	    gp_area += MB_2;
+
 	}
 	gp_pt += 512; // one page table
     }
@@ -930,11 +1036,16 @@ void register_umem_mmap(struct vm *vm)
         \   /
           2
     */
-    vm->metadata->num_nodes = 5;
+    vm->metadata->num_nodes = 3;
     {
+	/*
 	uint16_t tmp_arr[] = {
 	    0,1,1,2,1,0,2,4,5,5,5,1,2,3,4,3,
 	};
+	*/
+	uint16_t tmp_arr[] = {
+	    0,1,1,0,1,2,2,1,2,
+	};		
 	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
     }
     /*
@@ -1011,10 +1122,46 @@ void setup_irqfd(struct vm *vm, uint32_t gsi)
     vm->tmr_eventfd = irqfd.fd;
 }
 
+void* sock_loop(void *vvm)
+{
+    struct vm *vm = vvm;
+    int sock;
+    int buflen, sockaddr_len;
+    struct sockaddr saddr;
+    char *buffer;
+    /*
+    sock = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
+    if(sock < 0)
+	fatal("cannot create sock for the flow\n");
+    sockaddr_len = sizeof(saddr);
+    printf("sock listening on br0\n");
+    buffer = vm->shared_mem;
+    */
+    /*
+    buffer = mmap(NULL, MB_2, PROT_READ | PROT_WRITE,
+		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    */
+    /*
+    while(1) { 
+	buflen = recvfrom(sock, buffer, MB_2, 0, &saddr,
+			  (socklen_t *)&sockaddr_len);
+	if(buflen <= 0)
+	    fatal("buflen <= 0");
+	//printf("buflen = %d, buf = %d\n", buflen, *(int *)buffer);
+	sem_post(&sem_work_wait);
+	sem_wait(&sem_work_fin);
+	//sendto(sock, buffer, buflen, 0, &saddr, (socklen_t)sockaddr_len);
+    }
+    */
+    return NULL;
+}
+
 void setup_device_loop(struct vm *vm)
 {
     if(pthread_create(&vm->tid_tmr, NULL, timer_event_loop, vm))
 	fatal("Count create thread for timer\n");
+    if(pthread_create(&vm->tid_sock, NULL, sock_loop, vm))
+	fatal("Count create thread for timer\n");    
 }
 
 void print_segment(struct kvm_segment *seg)
@@ -1092,4 +1239,26 @@ void print_lapic_state(struct kvm_lapic_state *lapic)
     int i;
     for(i = 0; i < 0x40; i++)
 	printf("[%03X] = %08X\n", i << 4, *(uint32_t *)&lapic->regs[i << 4]);
+}
+
+void sigint_handler(int signum)
+{
+    int i;
+    for(i = 0; i < vm.ncpu; i++)
+    {
+	print_regs(&(vm.vcpu[i]));
+    }
+    signal(SIGINT, SIG_DFL); 
+}
+
+void install_signal_handlers()
+{
+    struct sigaction new_action, old_action;
+    /*
+    new_action.sa_handler = sigint_handler;
+    sigemptyset(&new_action.sa_mask);
+    new_action.sa_flags = 0;
+    sigaction(SIGINT, NULL, &old_action);
+    sigaction(SIGINT, &new_action, NULL);
+    */
 }
