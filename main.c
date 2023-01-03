@@ -259,12 +259,30 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    system("cat /proc/self/smaps | grep -i '^pss' | awk '//{s+=$2}END{print s}'");
 	    ts(t1);
 	}
+	//printf("shm = %d\n", *(int *)*(vcpu->shared_mem));
+	*(int *)*(vcpu->shared_mem) = 1;
 	buflen = 60;
+	{
+	    struct iovec iovec[2];
+	    struct msghdr msg;
+	    iovec[0].iov_base = *(vcpu->shared_mem) + sizeof(int);
+	    iovec[0].iov_len = buflen;
+	    msg.msg_name = vcpu->saddr_f;
+	    msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
+	    msg.msg_iov = iovec;
+	    msg.msg_iovlen = 1;
+	    msg.msg_control = NULL;
+	    msg.msg_controllen = 0;
+	    msg.msg_flags = 0;
+	    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
+	}
+	/*
 	if((buflen = recvfrom(*(vcpu->sock_f), *(vcpu->shared_mem), buflen,
 			      0, vcpu->saddr_f, (socklen_t *)vcpu->sockaddr_f_len)) <= 0)
 	    fatal("bad buflen\n");
+	*/
 	if(buflen != 60)
-	    printf("bad buflen\n");
+	    printf("bad buflen, buflen = %d\n", buflen);
 	//sem_post(&sem_work_fin);
 	//sem_wait(&sem_work_wait);
 	//exit(-1);
