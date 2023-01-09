@@ -24,6 +24,7 @@
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
 #include "runtime_if.h"
+#include "fn_if.h"
 #include "sock_flow.h"
 
 #define __IRQCHIP__
@@ -35,6 +36,7 @@
     } while(0)
 
 #define KB_1 (1024)
+#define KB_2 (2 * 1024)
 #define KB_4 (4 * 1024)
 #define MB_1 (1024 * KB_1)
 #define MB_2 (2 * MB_1)
@@ -50,6 +52,7 @@
 #define ARR_SZ_1D(x) (sizeof(x)/sizeof(x[0]))
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
+#define dtsc(y,x) ((y-x)%())
 #define pdt() printf("dt = %ld us\n", dt(t2,t1));
 #define pts(ts) printf("ts = %ld us\n", (ts.tv_sec*1000000 + ts.tv_usec));
 typedef struct
@@ -109,6 +112,7 @@ struct vm {
 int pktcnt = 0;
 struct timeval t1, t2;
 uint64_t tsc_t1, tsc_t2;
+double tsc2ts;
 sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
 sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
 
@@ -134,10 +138,9 @@ Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 
 static inline uint64_t tsc()
 {
-    uint64_t rax;
-    asm volatile("rdtscp\n": "=a"(rax));
-
-    return rax;
+    uint32_t eax, edx;
+    asm volatile("rdtscp\n": "=a"(eax),"=d"(edx));
+    return (uint64_t)eax | (((uint64_t)edx) << 32);
 }
 
 struct vm vm;
@@ -234,7 +237,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 {
     int i;
     int ret = 0, len;
-    char buf[128], buflen;
+    int buflen;
     
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
@@ -257,15 +260,18 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    system("cat /proc/self/smaps  | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'");
 	    printf("pss:\n");
 	    system("cat /proc/self/smaps | grep -i '^pss' | awk '//{s+=$2}END{print s}'");
+	    tsc_t1 = tsc();
 	    ts(t1);
 	}
 	//printf("shm = %d\n", *(int *)*(vcpu->shared_mem));
 	*(int *)*(vcpu->shared_mem) = 1;
-	buflen = 60;
+	buflen = MB_1;
 	{
 	    struct iovec iovec[2];
 	    struct msghdr msg;
-	    iovec[0].iov_base = *(vcpu->shared_mem) + sizeof(int);
+	    uint64_t addr = (uint64_t)*(vcpu->shared_mem);
+	    ((struct t_shm *)addr)->next = NULL;
+	    iovec[0].iov_base = addr + sizeof(struct t_shm);
 	    iovec[0].iov_len = buflen;
 	    msg.msg_name = vcpu->saddr_f;
 	    msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
@@ -275,14 +281,28 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    msg.msg_controllen = 0;
 	    msg.msg_flags = 0;
 	    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
+
+	    /*
+	    printf("shm: ");
+	    {
+		int h;
+		for(h = 0; h < 64; h++) {
+		    printf("%02X(%d,%c) ",((unsigned char *)(iovec[0].iov_base))[h],h,((char *)(iovec[0].iov_base))[h]);
+		    if((h-1) % 4 == 0)
+			printf("\n");
+		}
+	    }
+	    printf("\n");
+	    */
+	    
 	}
+	if(buflen <= 0)
+	    printf("bad buflen %d\n", buflen);
 	/*
 	if((buflen = recvfrom(*(vcpu->sock_f), *(vcpu->shared_mem), buflen,
 			      0, vcpu->saddr_f, (socklen_t *)vcpu->sockaddr_f_len)) <= 0)
 	    fatal("bad buflen\n");
 	*/
-	if(buflen != 60)
-	    printf("bad buflen, buflen = %d\n", buflen);
 	//sem_post(&sem_work_fin);
 	//sem_wait(&sem_work_wait);
 	//exit(-1);
@@ -292,7 +312,14 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//printf("%d: %d\n",buflen,pktcnt);
 	if(pktcnt >= 1000000) {
 	    ts(t2);
+	    tsc_t2 = tsc();
+	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);
 	    pdt();
+	    //printf("tsc2ts = %lf, tsc_t1 = %lu, ts_t2 = %lu, sub=%lu\n", tsc2ts, tsc_t1, tsc_t2, tsc_t2 - tsc_t1);
+	    for(i = 0; i < 3; i++) {
+		struct t_shm *shm = (struct t_shm *)(*(vcpu->shared_mem));
+		printf("fndt[%d] = %lf\n", i, ((double)shm->fndt[i]) * tsc2ts);
+	    }
 	    exit(-1);
 	}
 	/*

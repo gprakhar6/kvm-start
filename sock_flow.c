@@ -32,6 +32,7 @@ int get_sock_for_flow(struct sock_filter code[], int code_size, char ifname[])
         .filter = code,
     };
     ret = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+    //ret = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if(sock < 0) {
 	printf("%s-%d : Failure sock open\n", __FUNCTION__, __LINE__);
 	goto fail_sock;
