@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <assert.h>
 #include "globvar.h"
 #include "bits.h"
 #include "../elf-reader/elf-reader.h"
@@ -30,7 +31,7 @@
 #define __IRQCHIP__
 
 #define fatal(s, ...) do {				\
-	printf("%04d: %s :",__LINE__, strerror(errno));	\
+	printf("%s.%04d: %s :",__FILE__,__LINE__, strerror(errno));	\
 	printf(s, ##__VA_ARGS__);			\
 	exit(1);					\
     } while(0)
@@ -41,10 +42,14 @@
 #define MB_1 (1024 * KB_1)
 #define MB_2 (2 * MB_1)
 #define MB_512 (512 * MB_1)
+#define GB_1 (1024 * MB_1)
 
 #define ONE_PAGE (0x1000)
 #define GUEST_MEMORY (4 * 1024 * 1024)
 #define PAGE_MASK (0x1FFFFF)
+
+#define SHARED_PAGES (1)
+#define SHM_SIZE (MB_2 * SHARED_PAGES)
 
 #define SZ2PAGES(x) (((x) + MB_2 - 1) / MB_2)
 #define ROUND2PAGE(x) (SZ2PAGES(x) * MB_2)
@@ -55,6 +60,15 @@
 #define dtsc(y,x) ((y-x)%())
 #define pdt() printf("dt = %ld us\n", dt(t2,t1));
 #define pts(ts) printf("ts = %ld us\n", (ts.tv_sec*1000000 + ts.tv_usec));
+
+struct t_page_table {
+    uint64_t e[512];
+};
+
+struct t_pg_tbls {
+    struct t_page_table tbl[2];
+};
+
 typedef struct
 {
     int vcpufd;
@@ -80,6 +94,18 @@ struct func_prop {
     uint64_t stack_load_addr;
 };
 
+enum elf_type {
+    elf_lib = 1,
+    elf_uc
+};
+struct executable {
+    char name[MAX_NAME_LEN+1];
+    enum elf_type type;
+    unsigned char *mm;
+    uint32_t mm_size;
+    struct elf64_file elf;
+};
+
 struct vm {
     pid_t pid;
     int fd;
@@ -90,6 +116,7 @@ struct vm {
     struct func_prop kprop;
     uint64_t stack_start;
     uint64_t kern_end;
+    struct t_pg_tbls *tbls;
     struct kvm_cpuid2 *cpuid2;
     int mmap_size;
     uint8_t *kmem;
@@ -99,15 +126,19 @@ struct vm {
     pthread_t tid_tmr, tid_sock;
     int tmr_eventfd;
     uint8_t *shared_mem;
+    uint8_t *shared_user_code;
     int clifd;
     int sock_f, sockaddr_f_len;
     struct sockaddr saddr_f;
-    int num_mm;
-    void *mm[MAX_FUNC];
-    int mm_size[MAX_FUNC];
+    int num_exec;
+    int start_lib_idx;
+    int start_user_func_idx;
+    struct executable exec[MAX_FUNC];
     struct func_prop func_prop[MAX_FUNC];
     struct t_metadata *metadata;
 };
+
+const char limit_file[] = "../elf-reader/limits.txt";
 
 int pktcnt = 0;
 struct timeval t1, t2;
@@ -121,7 +152,6 @@ int get_vm(struct vm *vm);
 void register_kmem(struct vm *vm);
 void setup_vcpus(struct vm *vm);
 int setup_guest_phy2_host_virt_map(struct vm *vm);
-int setup_bootcode(struct vm *vm);
 int setup_bootcode_mmap(struct vm *vm);
 void snapshot_vm(struct vm *vm);
 int setup_usercode(struct vm *vm);
@@ -150,7 +180,7 @@ int main(int argc, char *argv[])
     int time_the_fork = 0;
     int sockfd, itrue, clifd, len;
     struct sockaddr_in servaddr, cli;
-    int server_port = 9988, max_listen = 4;
+    int server_port = SERVER_PORT, max_listen = MAX_LISTEN;
     char buf[128];
     switch(argc) {
     case 0:
@@ -160,22 +190,12 @@ int main(int argc, char *argv[])
 	if(strcmp(argv[1], "timeit") == 0) {
 	    printf("Timing the fork to boot time\n");
 	    time_the_fork = 1;
+	    printf("Not supported flag as of now\n");
+	    exit(-1);
 	}
 	break;
     }
-
-    if(time_the_fork == 1) {
-	ts(t1);
-	if(fork() != 0) {
-	    wait(&ret);
-	    pts(t1);
-	    //ts(t2);
-	    //pdt();
-	    exit(-1);
-	}
-    }
-    //setup_guest_phy2_host_virt_map(&vm); // 50 us
-    //setup_bootcode(&vm); // 750 us
+    init_limits(limit_file);
     setup_bootcode_mmap(&vm); // 750 us
     //setup_usercode(&vm); // 290 us
     setup_usercode_mmap(&vm); // 290 us
@@ -196,6 +216,8 @@ int main(int argc, char *argv[])
     if(listen(sockfd, max_listen) != 0) {
         fatal("listen failed\n");
     }
+    printf("(after funcs mmap)\nprivate_clean + private_dirty + private_hugetlb(kB):\n");
+    system("cat /proc/self/smaps  | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'");    
 read_again:
     clifd = accept(sockfd, (struct sockaddr *)&cli, &len);
     len = 100;
@@ -218,6 +240,7 @@ read_again:
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
     //register_umem(&vm);
     register_umem_mmap(&vm);
+    resolve_dynsyms(&vm);
     sem_post(&sem_usercode_loaded);    
     //snapshot_vm(&vm);
     //setup_irqfd(&vm, 1);
@@ -256,9 +279,11 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
     case 3: // MSG_WAITING_FOR_WORK
 	//pts(t2);
 	if(pktcnt == 0) {
-	    printf("private_clean + private_dirty + private_hugetlb:\n");
+	    ts(t2);
+	    printf("Boot time = %lu us\n", dt(t2,t1));
+	    printf("private_clean + private_dirty + private_hugetlb(kB):\n");
 	    system("cat /proc/self/smaps  | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'");
-	    printf("pss:\n");
+	    printf("pss(kB):\n");
 	    system("cat /proc/self/smaps | grep -i '^pss' | awk '//{s+=$2}END{print s}'");
 	    tsc_t1 = tsc();
 	    ts(t1);
@@ -281,7 +306,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    msg.msg_controllen = 0;
 	    msg.msg_flags = 0;
 	    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
-
+	    //printf("buflen = %d\n", buflen);
 	    /*
 	    printf("shm: ");
 	    {
@@ -672,54 +697,11 @@ void setup_vcpus(struct vm *vm)
 
 }
 
-const char limit_file[] = "../elf-reader/limits.txt";
-const char executable[] = "../boot/bin/main";
-int setup_bootcode(struct vm *vm)
-{
-    int ret;
-    int i, sz;
-    void *saddr;
-    Elf64_Addr daddr;
-    struct elf64_file elf;
-    Elf64_Shdr* shdr;
-    // to make all vcpu wait at barrier
-    sem_init(&vcpu_init_barrier, 0, 0);
-
-    init_limits(limit_file);
-    init_elf64_file(executable, &elf);
-
-    for(i = 0; i < elf.num_regions; i++) {
-	daddr = elf.prog_regions[i]->vaddr;
-	saddr = elf.prog_regions[i]->addr;
-	sz = elf.prog_regions[i]->filesz;
-	memcpy(&(vm->kmem[daddr]), saddr, sz);
-	printf("vaddr = %08lX saddr = %08lX\n",(uint64_t)daddr, (uint64_t)saddr);
-    }
-
-    vm->entry = elf.ehdr->e_entry;
-    shdr = get_shdr(&elf, ".stack");
-    if(shdr == NULL)
-	fatal("no stack section found for boot\n");
-    vm->stack_start = shdr->sh_addr + shdr->sh_size;
-    shdr = get_shdr(&elf, ".paging");
-    vm->kern_end = shdr->sh_addr + shdr->sh_size;
-    //printf("kern_end = %016lX\n", vm->kern_end);
-    //printf("stack for boot = %016lX\n", vm->stack_start);
-    //exit(1);
-    fini_elf64_file(&elf);
-
-    // tell all cpu code is ready and mapped
-    for(i = 0; i < vm->ncpu; i++)
-	sem_post(&vcpu_init_barrier);
-
-    return 0;
-}
-
 int setup_bootcode_mmap(struct vm *vm)
 {
     int fd; struct stat stat;
-    const char kernel_code[1024] = "../boot/bin/main_mapped";
-    const char kernel_prop[1024] = "../boot/bin/main_mapped_prop";
+    const char kernel_code[MAX_NAME_LEN+1] = "../boot/bin/main_mapped";
+    const char kernel_prop[MAX_NAME_LEN+1] = "../boot/bin/main_mapped_prop";
     FILE *fp;
     fd = open(kernel_code, O_RDWR);
     if(fd == -1)
@@ -745,245 +727,86 @@ int setup_bootcode_mmap(struct vm *vm)
     vm->entry = vm->kprop.entry;
     vm->stack_start = vm->kprop.stack_load_addr;
     vm->kern_end = MB_1; // TBD putting hard limit
+    //vm->tbls = (typeof(vm->tbls))(vm->kern_end - MAX_VCPUS * sizeof(struct t_pg_tbls));
+    //printf("tbls test: %08lX\n", vm->tbls[0].tbl[1].e[3]);    
 }
 
 void snapshot_vm(struct vm *vm)
 {
 }
-
-int setup_usercode(struct vm *vm)
-{
-    int ret;
-    int i, j, fsz, msz;
-    void *saddr;
-    Elf64_Addr daddr;
-    const char u_object_file[] = "tmp/main.o";
-    const char u_executable[][128] = {
-	"tmp/main",
-	"tmp/main",
-	"tmp/main",
-	"tmp/main",
-	"tmp/main",
-    };
-    char cmd[1024] = "bash create_executable.sh ";
-    struct elf64_file elf;
-    struct kvm_mp_state mp_state;
-    uint64_t vaddr;
-    uint8_t *hmem;
-    uint8_t *umem, *umem_s, *smem;
-    uint64_t kmem;
-    uint64_t *upt;
-    uint64_t ptidx, hudiff;
-    Elf64_Shdr* shdr;
-    //sem_wait(&sem_booted);
-
-    // TBD proper allocation of phy memory
-    vm->uphy_mem_size = MB_2 + MB_2 * ARR_SZ_1D(u_executable);
-    vm->umem = mmap(NULL, vm->uphy_mem_size, PROT_READ | PROT_WRITE,
-		    MAP_PRIVATE | MAP_ANONYMOUS, -1 , 0);
-
-    // should check MAP_FAILED TBD
-    if(!vm->umem)
-	fatal("cant mmap\n");
-
-    //printf("slot 1 userspace now has memory\n");
-    //return;
-    //printf("Creating usercode\n");
-    //strncat(cmd, u_object_file, sizeof(cmd)-1);
-    //printf("executing cmd: %s\n",cmd);
-    /*
-      if(system(cmd))
-      fatal("linking user code failed\n");
-    */
-    init_limits(limit_file);
-    smem = (uint8_t *)((uint64_t)vm->kphy_mem_size);
-    umem = (uint8_t *)((uint64_t)vm->kphy_mem_size + MB_2);
-    vm->shared_mem = vm->umem;
-    umem_s = umem;	
-    hmem = (uint8_t *)((uint64_t)(vm->umem) + MB_2); // host virt addr
-    kmem = vm->kern_end; // guest physical addr
-    hudiff = (uint64_t)hmem - (uint64_t)umem;
-    for(j = 0; j < ARR_SZ_1D(u_executable); j++) {
-    // guest phy addrthis is the end of kern 2MB
-	upt  = (typeof(upt))(&(vm->kmem[kmem]));
-	init_elf64_file(&u_executable[j][0], &elf);
-	memset(upt, 0, 512 * 8); // page table zeroing TBD, probably already zero
-	upt[0] = ((uint64_t)smem & (~PAGE_MASK)) |	\
-	    0x087; // big,X,X,X,X,user,writable,present
-	vm->metadata->func_info[j].pt_addr = kmem;
-	shdr = get_shdr(&elf, ".stack");
-	vm->metadata->func_info[j].stack_load_addr = \
-	    shdr->sh_addr + shdr->sh_size;
-	vm->metadata->func_info[j].entry_addr = elf.ehdr->e_entry;
-	for(i = 0; i < elf.num_regions; i++) {
-	    vaddr = elf.prog_regions[i]->vaddr;
-	    saddr = elf.prog_regions[i]->addr;
-	    ptidx = (vaddr & 0x3FE00000) >> 21;
-	    if(upt[ptidx] == 0) {
-		//printf("umem = %016lX\n", (uint64_t)umem);
-		//printf("ptidx = %ld\n", ptidx);
-		upt[ptidx] = ((uint64_t)umem & (~PAGE_MASK)) |	\
-		    0x087; // big,X,X,X,X,user,writable,present
-		umem = (typeof(umem))((uint64_t)umem + MB_2);
-		//printf("Increased umem\n");
-	    }
-	    daddr = (Elf64_Addr)(((upt[ptidx] & (~PAGE_MASK)) |		\
-				  (vaddr & PAGE_MASK)) + hudiff);
-	    /*
-	      printf("ptidx = %ld, vaddr = %016lX\n",
-	      ptidx, vaddr);
-	    */
-	    fsz = elf.prog_regions[i]->filesz;
-	    msz = elf.prog_regions[i]->memsz;
-	    //printf("%02d: %016lx %016lx %04d %04d\n\n", i, daddr, (uint64_t)saddr, fsz, msz);
-	    memcpy((void *)daddr, saddr, fsz);
-	}
-	kmem += 512*8;
-	if(kmem > (MB_2)) {
-	    fatal("Crossed kernel 2MB for page tables");
-	}
-	if((uint64_t)umem - (uint64_t)umem_s > vm->uphy_mem_size) {
-	    fatal("Functions need more memory than allocated\n");
-	}
-	fini_elf64_file(&elf);
-    }
-    /*
-      dag repr:
-      num_nodes
-      in_vertex_count_per_node
-      start_of_out_vertex_idxes
-
-          1
-        /   \
-       0     3
-        \   /
-          2
-
-      output repr:
-      4  // num_nodes
-      0  // 0 in count dag[] starts here
-      1  // 1 in count
-      1  // 2 in count
-      2  // 3 in count
-      0  // 0 start_idx
-      2  // 1 start_idx
-      3  // 2 start_idx
-      4  // 3 start_idx  (no out edge so same idxes)
-      4  // 3 end_idx
-      1  // out_edge 0
-      2
-      3  // out_edge 1
-      3  // out_edge 2
-     */
-
-    /*
-          1
-        /   \
-       0     3
-        \   /
-          2
-    */
-    vm->metadata->num_nodes = 2;
-    {
-	/*
-	uint16_t tmp_arr[] = {
-	    0,1,1,2,1,0,2,4,5,5,5,1,2,3,4,3,
-	};
-	*/
-	uint16_t tmp_arr[] = {
-	    0,1,0,1,1,1,
-	};	
-	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
-    }
-    /*
-    vm->metadata->dag[0] = 0; // in nodes 0
-    vm->metadata->dag[1] = 1; // in nodes 1
-    vm->metadata->dag[2] = 1; // in nodes 2
-    vm->metadata->dag[3] = 2; // in nodes 3
-    vm->metadata->dag[4] = 0;
-    vm->metadata->dag[5] = 2;
-    vm->metadata->dag[6] = 3;
-    vm->metadata->dag[7] = 4;
-    vm->metadata->dag[8] = 4;
-    vm->metadata->dag[9] = 1; // out 0
-    vm->metadata->dag[10] = 2;
-    vm->metadata->dag[11] = 3; // out 1
-    vm->metadata->dag[12] = 3; // out 2
-    vm->metadata->dag[13] = 0; // out 3
-    */
-    memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
-    vm->metadata->start_func = 0;
-    //printf("Completed user code creation\n");
-
-}
-
+// not used this function
 int setup_usercode_mmap(struct vm *vm)
 {
     int i, j, num_pages;
     uint64_t gp_pt; // guest physical, page table start for funcs
-    const char u_executable[][1024] = {
-	"/home/prakhar/data/code/nfvs/firewall/main_mapped",
-	"/home/prakhar/data/code/nfvs/ids/main_mapped",
-	"/home/prakhar/data/code/nfvs/encrypt/main_mapped",
-    };
-    char u_executable_prop[ARR_SZ_1D(u_executable)][1024];
-    for(i = 0; i < ARR_SZ_1D(u_executable); i++) {
-	strcpy(&u_executable_prop[i][0], &u_executable[i][0]);
-	strcat(&u_executable_prop[i][0], "_prop");
+    char buf[MAX_NAME_LEN+1];
+    {
+	struct executable u_exec[] = {
+	    {.name = "/home/prakhar/data/code/shared_user_code/shared_user_code",
+	     .type = elf_uc},
+	    {.name = "/home/prakhar/data/code/libso_test/libmylib.so",
+	     .type = elf_lib},
+	    {.name = "/home/prakhar/data/code/nfvs/firewall/main",
+	     .type = elf_uc},
+	    {.name = "/home/prakhar/data/code/nfvs/ids/main",
+	     .type = elf_uc},
+	    {.name = "/home/prakhar/data/code/nfvs/encrypt/main",
+	     .type = elf_uc},
+	    {.name = ""}, // end of executables
+	};
+	assert(sizeof(u_exec) < sizeof(vm->exec));
+	memcpy(vm->exec, u_exec, sizeof(u_exec));
     }
-    
+    vm->start_lib_idx = 1;
+    vm->start_user_func_idx = 2;
     vm->shared_mem = \
-	(uint8_t *)mmap(NULL, MB_2, PROT_READ | PROT_WRITE, \
+	(uint8_t *)mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, \
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if(vm->shared_mem == MAP_FAILED)
 	fatal("shared mapping failed\n");
-    vm->num_mm = 0;
-    for(i = 0; i < ARR_SZ_1D(u_executable); i++) {
-	
+    vm->num_exec = 0;
+    for(i = 0; i < ARR_SZ_1D(vm->exec); i++) {
 	int fd;
 	struct stat stat;
 	FILE *fp;
-	fd = open(&u_executable[i][0], O_RDWR);
+	if(vm->exec[i].name[0] == '\0')
+	    break;
+	// TBD where to call fin
+	init_elf64_file(vm->exec[i].name, &(vm->exec[i].elf));
+	strncpy(buf, vm->exec[i].name, MAX_NAME_LEN);
+	strncat(buf, STR_MAPPED, MAX_NAME_LEN - strnlen(buf, MAX_NAME_LEN));
+	fd = open(buf, O_RDWR);
 	if(fd == -1)
-	    fatal("unable to open %s\n", &u_executable[i][0]);
-	fp = fopen(&u_executable_prop[i][0], "r");
+	    fatal("unable to open %s\n", buf);
+	strncat(buf, STR_PROP, MAX_NAME_LEN - strnlen(buf, MAX_NAME_LEN));
+	fp = fopen(buf, "r");
 	if(fp == NULL)
-	    fatal("cannot open %s\n", &u_executable_prop[i][0]);
+	    fatal("cannot open %s\n", buf);
 
 	fread(&vm->func_prop[i], sizeof(vm->func_prop[i]), 1, fp);
 	fstat(fd, &stat);
-	vm->mm[i] = (uint8_t *)mmap(NULL, stat.st_size, \
+	vm->exec[i].mm = (uint8_t *)mmap(NULL, stat.st_size,	\
 				    PROT_READ | PROT_WRITE, \
 				    MAP_PRIVATE,fd, 0);
-	if(vm->mm[i] == MAP_FAILED)
-	    fatal("mmap of %s failed\n", &u_executable[i][0]);
+	if(vm->exec[i].mm == MAP_FAILED)
+	    fatal("mmap of %s failed\n", vm->exec[i].name);
 	close(fd);
 	fclose(fp);
-        vm->mm_size[i] = stat.st_size;
-	vm->num_mm++;
-    }
-}
-// call after copying user data
-void register_umem(struct vm *vm)
-{
-    struct kvm_userspace_memory_region region = {
-	.slot = vm->slot_no++,
-	.flags = 0,
-	.guest_phys_addr = vm->kphy_mem_size,
-	.memory_size = vm->uphy_mem_size,
-	.userspace_addr = (size_t) vm->umem
-    };
-    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+	if(stat.st_size > GB_1)
+	    fatal("too big of a memory image\n");
+        vm->exec[i].mm_size = (uint32_t)stat.st_size;
+	if((vm->exec[i].mm_size) == 0)
+	    fatal("vm->exec[%d].mm_size = 0\n", i);
+	vm->num_exec++;
     }
 }
 
 // call after copying user data and kern data
 void register_umem_mmap(struct vm *vm)
 {
-    int i, j;
+    int i, j, init_j, fni;
     uint64_t *gp_pt; // guest physical page table
-    uint64_t gp_mem, gp_shm;
+    uint64_t gp_mem, gp_shm, gp_shc;
     uint64_t hv_kmem;
     gp_mem = vm->kphy_mem_size; // end of k pages
     gp_pt = (uint64_t *)vm->kern_end;
@@ -994,7 +817,7 @@ void register_umem_mmap(struct vm *vm)
 	    .slot = vm->slot_no++,
 	    .flags = 0,
 	    .guest_phys_addr = gp_mem,
-	    .memory_size = MB_2, // shm is 2mb
+	    .memory_size = SHM_SIZE, // shm should be multiple of MB_2
 	    .userspace_addr = (size_t) vm->shared_mem
 	};
 	//printf("registering shared mem\n");
@@ -1007,8 +830,26 @@ void register_umem_mmap(struct vm *vm)
 	gp_mem += region.memory_size;
 	gp_mem = ROUND2PAGE(gp_mem);
     }
-
-    for(i = 0; i < vm->num_mm; i++) {
+    // register the shared user code
+    {
+	struct kvm_userspace_memory_region region = {
+	    .slot = vm->slot_no++,
+	    .flags = 0,
+	    .guest_phys_addr = gp_mem,
+	    .memory_size = vm->exec[0].mm_size,
+	    .userspace_addr = (size_t) vm->exec[0].mm
+	};
+	//printf("%08u, %08lX\n", vm->mm_size[0], (size_t) vm->mm[0]);
+	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+	}
+	//printf("registered shared mem\n");
+	gp_shc = region.guest_phys_addr;
+	gp_mem += region.memory_size;
+	gp_mem = ROUND2PAGE(gp_mem);
+    }
+    // i = 0 is the shared_user_code
+    for(i = vm->start_lib_idx; i < vm->num_exec; i++) {
 	int num_pages;
 	uint64_t gp_area;
 	{
@@ -1016,8 +857,8 @@ void register_umem_mmap(struct vm *vm)
 		.slot = vm->slot_no++,
 		.flags = 0,
 		.guest_phys_addr = gp_mem,
-		.memory_size = vm->mm_size[i],
-		.userspace_addr = (size_t) vm->mm[i]
+		.memory_size = vm->exec[i].mm_size,
+		.userspace_addr = (size_t) vm->exec[i].mm
 	    };
 	    //printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
 	    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
@@ -1028,21 +869,27 @@ void register_umem_mmap(struct vm *vm)
 	    gp_mem = ROUND2PAGE(gp_mem);
 	}
 	//printf("%08lX\n", *(uint64_t *)vm->mm[i]);
-	vm->metadata->func_info[i].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
-	vm->metadata->func_info[i].stack_load_addr = \
-	    (typeof(vm->metadata->func_info[i].stack_load_addr))vm->func_prop[i].stack_load_addr;
-	vm->metadata->func_info[i].entry_addr \
-	    = (typeof(vm->metadata->func_info[i].entry_addr))vm->func_prop[i].entry;
+	num_pages = SZ2PAGES(vm->exec[i].mm_size);
+	if(i >= vm->start_user_func_idx) {
+	    fni = i - vm->start_user_func_idx;
+	    vm->metadata->func_info[fni].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
+	    vm->metadata->func_info[fni].stack_load_addr =		\
+		(typeof(vm->metadata->func_info[fni].stack_load_addr))vm->func_prop[i].stack_load_addr;
+	    vm->metadata->func_info[fni].entry_addr			\
+		= (typeof(vm->metadata->func_info[fni].entry_addr))vm->func_prop[i].entry;
+	    *(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
+	    *(uint64_t *)H2G(hv_kmem, gp_pt[1]) = gp_shc | 0x087;
+	    init_j = 2;
+	} else {
+	    init_j = 0; // shared lib dont have shm or shm_uc
+	}
 	
-	num_pages = SZ2PAGES(vm->mm_size[i]);
-	*(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
-	for(j = 1; j <= num_pages; j++) {
+	for(j = init_j; j < num_pages+init_j; j++) {
 	    *(uint64_t *)H2G(hv_kmem, gp_pt[j]) = gp_area | \
 		0x087; // big,X,X,X,X,user,writable,present
 	    //printf("func %d:num_pages=%d:pt[%d] %08lX\n", i, num_pages, j, *(uint64_t *)H2G(hv_kmem, gp_pt[j]));
 	    gp_area += MB_2;
-
-	}
+	}	
 	gp_pt += 512; // one page table
     }
     /*
@@ -1112,6 +959,25 @@ void register_umem_mmap(struct vm *vm)
     memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
     vm->metadata->start_func = 0;    
     //exit(-1);
+}
+
+void resolve_dynsyms(struct vm *vm)
+{
+    int i, syms_sz, j, idx;
+    Elf64_Sym *syms;
+    struct elf64_file *elf;
+    for(i = 0; i < vm->num_exec; i++) {
+	elf = &(vm->exec[i].elf);
+	if(elf->dynsyms != NULL) {
+	    syms = elf->dynsyms;
+	    syms_sz = elf->dynsyms_sz;
+	    for(j = 0; j < syms_sz; j++) {
+		idx = syms[j].st_name;
+		if(idx != 0) 
+		    printf("%d,%d,%d: %s\n", i, j, idx, &(elf->dynstrtbl[idx]));
+	    }
+	}
+    }
 }
 
 void* timer_event_loop(void *vvm)

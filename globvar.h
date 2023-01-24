@@ -2,7 +2,11 @@
 #define __GLOBVAR_H__
 
 #define MAX_VCPUS                        (64) // because uint64_t
-
+#define SERVER_PORT                      (9988)
+#define MAX_LISTEN                       (4)
+#define MAX_NAME_LEN                     (1023)
+#define STR_MAPPED                       ("_mapped")
+#define STR_PROP                         ("_prop")
 #define NULL_FUNC  (255)
 
 
