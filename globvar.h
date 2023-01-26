@@ -1,6 +1,14 @@
 #ifndef __GLOBVAR_H__
 #define __GLOBVAR_H__
 
+#define KB_1 (1024)
+#define KB_2 (2 * 1024)
+#define KB_4 (4 * 1024)
+#define MB_1 (1024 * KB_1)
+#define MB_2 (2 * MB_1)
+#define MB_512 (512 * MB_1)
+#define GB_1 (1024 * MB_1)
+
 #define MAX_VCPUS                        (64) // because uint64_t
 #define SERVER_PORT                      (9988)
 #define MAX_LISTEN                       (4)
@@ -9,6 +17,7 @@
 #define STR_PROP                         ("_prop")
 #define NULL_FUNC  (255)
 
+#define SHARED_PAGES (1)
 
 #define	 PORT_SERIAL			 (0x3f8)
 #define	 PORT_WAIT_USER_CODE_MAPPING	 (0x3f9)

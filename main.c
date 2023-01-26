@@ -36,19 +36,10 @@
 	exit(1);					\
     } while(0)
 
-#define KB_1 (1024)
-#define KB_2 (2 * 1024)
-#define KB_4 (4 * 1024)
-#define MB_1 (1024 * KB_1)
-#define MB_2 (2 * MB_1)
-#define MB_512 (512 * MB_1)
-#define GB_1 (1024 * MB_1)
-
 #define ONE_PAGE (0x1000)
-#define GUEST_MEMORY (4 * 1024 * 1024)
+
 #define PAGE_MASK (0x1FFFFF)
 
-#define SHARED_PAGES (1)
 #define SHM_SIZE (MB_2 * SHARED_PAGES)
 
 #define SZ2PAGES(x) (((x) + MB_2 - 1) / MB_2)
@@ -151,11 +142,11 @@ static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
 void register_kmem(struct vm *vm);
 void setup_vcpus(struct vm *vm);
-int setup_guest_phy2_host_virt_map(struct vm *vm);
 int setup_bootcode_mmap(struct vm *vm);
 void snapshot_vm(struct vm *vm);
 int setup_usercode(struct vm *vm);
 int setup_usercode_mmap(struct vm *vm);
+void resolve_dynsyms(struct vm *vm);
 void register_umem(struct vm *vm);
 void register_umem_mmap(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
@@ -199,7 +190,7 @@ int main(int argc, char *argv[])
     setup_bootcode_mmap(&vm); // 750 us
     //setup_usercode(&vm); // 290 us
     setup_usercode_mmap(&vm); // 290 us
-    
+    resolve_dynsyms(&vm);    
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sockfd == -1)
 	fatal("Unable to get a socket");
@@ -240,7 +231,6 @@ read_again:
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
     //register_umem(&vm);
     register_umem_mmap(&vm);
-    resolve_dynsyms(&vm);
     sem_post(&sem_usercode_loaded);    
     //snapshot_vm(&vm);
     //setup_irqfd(&vm, 1);
@@ -422,25 +412,6 @@ static inline int handle_io_port(t_vcpu *vcpu)
     }
 
     return 0;
-}
-
-int setup_guest_phy2_host_virt_map(struct vm *vm)
-{
-    int err;
-    err = 0;
-    vm->kphy_mem_size = GUEST_MEMORY;
-    vm->kmem = mmap(NULL, vm->kphy_mem_size, PROT_READ | PROT_WRITE,
-		    MAP_PRIVATE | MAP_ANONYMOUS, -1 , 0);
-
-    // should check MAP_FAILED TBD
-    if(!vm->kmem)
-	fatal("cant mmap\n");
-
-    //mlock(vm->kmem, vm->kphy_mem_size);
-    // TBD hopefully zero at init, cant have state machine with junk state
-    vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);
-
-    return err;
 }
 
 static struct sock_filter code[] = {
@@ -702,7 +673,13 @@ int setup_bootcode_mmap(struct vm *vm)
     int fd; struct stat stat;
     const char kernel_code[MAX_NAME_LEN+1] = "../boot/bin/main_mapped";
     const char kernel_prop[MAX_NAME_LEN+1] = "../boot/bin/main_mapped_prop";
+    const char kernel_elf[MAX_NAME_LEN+1] = "../boot/bin/main";
+    struct elf64_file elf;
+    Elf64_Shdr *shdr;
     FILE *fp;
+
+    init_elf64_file(kernel_elf, &elf);
+    
     fd = open(kernel_code, O_RDWR);
     if(fd == -1)
 	fatal("Unable to open kernel code\n");
@@ -726,9 +703,14 @@ int setup_bootcode_mmap(struct vm *vm)
     // TBD Compatibility
     vm->entry = vm->kprop.entry;
     vm->stack_start = vm->kprop.stack_load_addr;
-    vm->kern_end = MB_1; // TBD putting hard limit
+    shdr = get_shdr(&elf, ".kfree_space");
+    if(shdr == NULL)
+	fatal("no .kfree_space section found");
+    vm->kern_end = shdr->sh_addr;
+    printf("kern_end = %ld\n", vm->kern_end / KB_1);
     //vm->tbls = (typeof(vm->tbls))(vm->kern_end - MAX_VCPUS * sizeof(struct t_pg_tbls));
-    //printf("tbls test: %08lX\n", vm->tbls[0].tbl[1].e[3]);    
+    //printf("tbls test: %08lX\n", vm->tbls[0].tbl[1].e[3]);
+    fini_elf64_file(&elf);
 }
 
 void snapshot_vm(struct vm *vm)
@@ -966,18 +948,31 @@ void resolve_dynsyms(struct vm *vm)
     int i, syms_sz, j, idx;
     Elf64_Sym *syms;
     struct elf64_file *elf;
+
+#if 1
+    //printf("%016lX\n", dynsym(&vm->exec[1].elf, "myfunc")->st_value);
     for(i = 0; i < vm->num_exec; i++) {
+	//print_relocs(&(vm->exec[i].elf));
+	print_needed_libs(&(vm->exec[i].elf));
+	continue;
 	elf = &(vm->exec[i].elf);
 	if(elf->dynsyms != NULL) {
 	    syms = elf->dynsyms;
-	    syms_sz = elf->dynsyms_sz;
+	    syms_sz = elf->dynsyms_size;
 	    for(j = 0; j < syms_sz; j++) {
 		idx = syms[j].st_name;
-		if(idx != 0) 
-		    printf("%d,%d,%d: %s\n", i, j, idx, &(elf->dynstrtbl[idx]));
+		if(idx != 0) {
+		    printf("%d,%d,%d: %s,%016lX,%02X-%02X, %d\n", i, j, idx, &(elf->dynstrtbl[idx]), syms[j].st_value, syms[j].st_info,syms[j].st_other, syms[j].st_shndx);
+		    if((ELF64_ST_TYPE(syms[j].st_info) == STT_FUNC) &&
+		       (ELF64_ST_BIND(syms[j].st_info) == STB_GLOBAL) &&
+		       (ELF64_ST_VISIBILITY(syms[j].st_other) == STV_DEFAULT)) {
+			printf("match\n");
+		    }
+		}
 	    }
 	}
     }
+#endif
 }
 
 void* timer_event_loop(void *vvm)
