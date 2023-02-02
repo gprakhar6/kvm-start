@@ -109,6 +109,7 @@ struct vm {
     struct func_prop kprop;
     uint64_t stack_start;
     uint64_t kern_end;
+    uint64_t paging;
     struct t_pg_tbls *tbls;
     struct kvm_cpuid2 *cpuid2;
     int mmap_size;
@@ -282,7 +283,9 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    struct msghdr msg;
 	    uint64_t addr = (uint64_t)*(vcpu->shared_mem);
 	    ((struct t_shm *)addr)->next = NULL;
-	    iovec[0].iov_base = addr + sizeof(struct t_shm);
+	    iovec[0].iov_base = \
+		(typeof(iovec[0].iov_base))(addr + \
+					    sizeof(struct t_shm));
 	    iovec[0].iov_len = buflen;
 	    msg.msg_name = vcpu->saddr_f;
 	    msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
@@ -585,7 +588,7 @@ void *create_vcpu(void *vvcpu)
 	    break;
 	case KVM_EXIT_IO:
 	    if(handle_io_port(vcpu))
-		return;
+		return NULL;
 	    break;
 	case KVM_EXIT_SHUTDOWN:
 	    print_regs(vcpu);
@@ -606,7 +609,7 @@ void *create_vcpu(void *vvcpu)
 
 finish:
     print_regs(vcpu);
-    return;
+    return NULL;
 }
 
 void setup_vcpus(struct vm *vm)
@@ -704,6 +707,11 @@ int setup_bootcode_mmap(struct vm *vm)
 	fatal("no .kfree_space section found");
     vm->kern_end = shdr->sh_addr; // this better be alined to 4KB
     printf("kern_end = %ld\n", vm->kern_end / KB_1);
+    shdr = get_shdr(&elf, ".paging");
+    if(shdr == NULL)
+	fatal("no .paging section found");
+    vm->paging = shdr->sh_addr;
+    printf("paging section start = %08lX\n", vm->paging);
     //vm->tbls = (typeof(vm->tbls))(vm->kern_end - MAX_VCPUS * sizeof(struct t_pg_tbls));
     //printf("tbls test: %08lX\n", vm->tbls[0].tbl[1].e[3]);
     fini_elf64_file(&elf);
@@ -838,7 +846,7 @@ void register_umem_mmap(struct vm *vm)
     int i, j, init_j, fni, init_i;
     uint64_t *gp_pt; // guest physical page table
     uint64_t gp_mem, gp_shm, gp_shc;
-    uint64_t hv_kmem;
+    uint64_t hv_kmem, templ_boot_p3;
     gp_mem = vm->kphy_mem_size; // end of k pages
     gp_pt = (uint64_t *)vm->kern_end;
     hv_kmem = (uint64_t)vm->kmem;
@@ -858,11 +866,26 @@ void register_umem_mmap(struct vm *vm)
 	//printf("%08lX\n", *(uint64_t *)vm->mm[i]);
 	num_pages = SZ2PAGES(vm->exec_deps[i].exec[0].mm_size);
 	fni = i - init_i;
-	vm->metadata->func_info[fni].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
+	vm->metadata->func_info[fni].pt_addr = \
+	    (typeof(vm->metadata->func_info[i].pt_addr))(gp_pt);
+	//printf("pt_addr = %016lX\n", vm->metadata->func_info[fni].pt_addr);
 	vm->metadata->func_info[fni].stack_load_addr =			\
-	    (typeof(vm->metadata->func_info[fni].stack_load_addr))vm->exec_deps[i].func_prop.stack_load_addr;
+	    (typeof(vm->metadata->func_info[fni].stack_load_addr))\
+	    vm->exec_deps[i].func_prop.stack_load_addr;
 	vm->metadata->func_info[fni].entry_addr				\
-	    = (typeof(vm->metadata->func_info[fni].entry_addr))vm->exec_deps[i].func_prop.entry;
+	    = (typeof(vm->metadata->func_info[fni].entry_addr))\
+	    vm->exec_deps[i].func_prop.entry;
+
+	// copy first 4 entries
+	// templ_boot_p3 is after apic page
+	templ_boot_p3 = hv_kmem + vm->paging + 512 * sizeof(uint64_t);
+	
+	memcpy((void *)H2G(hv_kmem, gp_pt[0]),
+	       (void *)templ_boot_p3,
+	       sizeof(uint64_t) * 4);
+	*(uint64_t *)H2G(hv_kmem, gp_pt[2]) = (uint64_t)(gp_pt + 512) | 0x07;
+	gp_pt += 512;
+	// this is p2
 	*(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
 	*(uint64_t *)H2G(hv_kmem, gp_pt[1]) = gp_shc | 0x087;
 	init_j = 2;

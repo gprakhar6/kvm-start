@@ -34,14 +34,6 @@ static int pop_q(struct lib_queue *q);
 static char* iterate_deps(struct exec_info *e, int *i);
 static int in_exec_info(struct lib_deps *deps, char *dep_name);
 
-static char dep_tree[][3][MAX_NAME_LEN + 1] = {
-    {"abc", "abc1", "abc2"},
-    {"abc1", "xyz1", "abc2"},
-    {"xyz1", "a1", ""},
-    {"a1", "abc2", ""},
-    {"abc2", "", ""}
-};
-
 void init_queue(struct lib_queue *q, int *q_arr, int sz)
 {
     q->queue = q_arr;
