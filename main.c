@@ -27,6 +27,8 @@
 #include "runtime_if.h"
 #include "fn_if.h"
 #include "sock_flow.h"
+#include "typedef.h"
+#include "resolve_deps.h"
 
 #define __IRQCHIP__
 
@@ -80,14 +82,14 @@ typedef struct
     sem_t *sem_vcpu_init;
 } t_vcpu;
 
-struct func_prop {
-    uint64_t entry;
-    uint64_t stack_load_addr;
-};
-
 enum elf_type {
     elf_lib = 1,
     elf_uc
+};
+
+struct exec_path_name {
+    char path[MAX_NAME_LEN + 1];
+    char name[MAX_NAME_LEN + 1];
 };
 struct executable {
     char name[MAX_NAME_LEN+1];
@@ -121,22 +123,20 @@ struct vm {
     int clifd;
     int sock_f, sockaddr_f_len;
     struct sockaddr saddr_f;
+    struct lib_deps exec_deps[MAX_FUNC];
     int num_exec;
-    int start_lib_idx;
-    int start_user_func_idx;
-    struct executable exec[MAX_FUNC];
-    struct func_prop func_prop[MAX_FUNC];
     struct t_metadata *metadata;
 };
 
 const char limit_file[] = "../elf-reader/limits.txt";
 
-int pktcnt = 0;
-struct timeval t1, t2;
-uint64_t tsc_t1, tsc_t2;
-double tsc2ts;
-sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
-sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
+static int pktcnt = 0;
+static struct timeval t1, t2;
+static uint64_t tsc_t1, tsc_t2;
+static double tsc2ts;
+static sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
+static sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
+char *ATARU_LD_FUNC_PATH;
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
@@ -144,10 +144,8 @@ void register_kmem(struct vm *vm);
 void setup_vcpus(struct vm *vm);
 int setup_bootcode_mmap(struct vm *vm);
 void snapshot_vm(struct vm *vm);
-int setup_usercode(struct vm *vm);
 int setup_usercode_mmap(struct vm *vm);
 void resolve_dynsyms(struct vm *vm);
-void register_umem(struct vm *vm);
 void register_umem_mmap(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
@@ -188,7 +186,6 @@ int main(int argc, char *argv[])
     }
     init_limits(limit_file);
     setup_bootcode_mmap(&vm); // 750 us
-    //setup_usercode(&vm); // 290 us
     setup_usercode_mmap(&vm); // 290 us
     resolve_dynsyms(&vm);    
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -229,7 +226,6 @@ read_again:
     register_kmem(&vm);
     vm.ncpu = 1;
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
-    //register_umem(&vm);
     register_umem_mmap(&vm);
     sem_post(&sem_usercode_loaded);    
     //snapshot_vm(&vm);
@@ -706,7 +702,7 @@ int setup_bootcode_mmap(struct vm *vm)
     shdr = get_shdr(&elf, ".kfree_space");
     if(shdr == NULL)
 	fatal("no .kfree_space section found");
-    vm->kern_end = shdr->sh_addr;
+    vm->kern_end = shdr->sh_addr; // this better be alined to 4KB
     printf("kern_end = %ld\n", vm->kern_end / KB_1);
     //vm->tbls = (typeof(vm->tbls))(vm->kern_end - MAX_VCPUS * sizeof(struct t_pg_tbls));
     //printf("tbls test: %08lX\n", vm->tbls[0].tbl[1].e[3]);
@@ -716,6 +712,8 @@ int setup_bootcode_mmap(struct vm *vm)
 void snapshot_vm(struct vm *vm)
 {
 }
+
+#if 0
 // not used this function
 int setup_usercode_mmap(struct vm *vm)
 {
@@ -726,8 +724,6 @@ int setup_usercode_mmap(struct vm *vm)
 	struct executable u_exec[] = {
 	    {.name = "/home/prakhar/data/code/shared_user_code/shared_user_code",
 	     .type = elf_uc},
-	    {.name = "/home/prakhar/data/code/libso_test/libmylib.so",
-	     .type = elf_lib},
 	    {.name = "/home/prakhar/data/code/nfvs/firewall/main",
 	     .type = elf_uc},
 	    {.name = "/home/prakhar/data/code/nfvs/ids/main",
@@ -783,10 +779,63 @@ int setup_usercode_mmap(struct vm *vm)
     }
 }
 
+#endif
+int setup_usercode_mmap(struct vm *vm)
+{
+    int i;
+    struct exec_path_name u_exec[] = {
+	{.path = "/home/prakhar/data/code/shared_user_code/",
+	 .name = "shared_user_code"
+	},
+	{.path = "/home/prakhar/data/code/nfvs/firewall/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/nfvs/ids/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/nfvs/encrypt/",
+	 .name = "main"
+	},
+	{.path = "",
+	 .name = ""
+	}
+    };
+    assert(sizeof(u_exec) < sizeof(vm->exec_deps));
+    vm->shared_mem =						\
+	(uint8_t *)mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, \
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(vm->shared_mem == MAP_FAILED)
+	fatal("shared mapping failed\n");
+    vm->num_exec = 0;
+    for(i = 0; i < ARR_SZ_1D(vm->exec_deps); i++) {
+	if(u_exec[i].name[0] == '\0')
+	    break;
+	// TBD where to call fin
+	ATARU_LD_FUNC_PATH = u_exec[i].path;
+	gen_deps(&vm->exec_deps[i], u_exec[i].name);
+	vm->num_exec++;
+    }
+}
+
+void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
+		  uint64_t sz)
+{
+    struct kvm_userspace_memory_region region = {
+	.slot = vm->slot_no++,
+	.flags = 0,
+	.guest_phys_addr = *gpa,
+	.memory_size = sz,
+	.userspace_addr = (size_t) hva
+    };
+    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0)
+	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+    *gpa += sz;
+    *gpa = ROUND2PAGE(*gpa);
+}
 // call after copying user data and kern data
 void register_umem_mmap(struct vm *vm)
 {
-    int i, j, init_j, fni;
+    int i, j, init_j, fni, init_i;
     uint64_t *gp_pt; // guest physical page table
     uint64_t gp_mem, gp_shm, gp_shc;
     uint64_t hv_kmem;
@@ -794,78 +843,29 @@ void register_umem_mmap(struct vm *vm)
     gp_pt = (uint64_t *)vm->kern_end;
     hv_kmem = (uint64_t)vm->kmem;
     // shared memory below kmem end page
-    {
-	struct kvm_userspace_memory_region region = {
-	    .slot = vm->slot_no++,
-	    .flags = 0,
-	    .guest_phys_addr = gp_mem,
-	    .memory_size = SHM_SIZE, // shm should be multiple of MB_2
-	    .userspace_addr = (size_t) vm->shared_mem
-	};
-	//printf("registering shared mem\n");
-	//printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
-	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
-	}
-	//printf("registered shared mem\n");
-	gp_shm = region.guest_phys_addr;
-	gp_mem += region.memory_size;
-	gp_mem = ROUND2PAGE(gp_mem);
-    }
+    gp_shm = gp_mem;
+    register_mem(vm, vm->shared_mem, &gp_mem, SHM_SIZE);
     // register the shared user code
-    {
-	struct kvm_userspace_memory_region region = {
-	    .slot = vm->slot_no++,
-	    .flags = 0,
-	    .guest_phys_addr = gp_mem,
-	    .memory_size = vm->exec[0].mm_size,
-	    .userspace_addr = (size_t) vm->exec[0].mm
-	};
-	//printf("%08u, %08lX\n", vm->mm_size[0], (size_t) vm->mm[0]);
-	if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-	    fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
-	}
-	//printf("registered shared mem\n");
-	gp_shc = region.guest_phys_addr;
-	gp_mem += region.memory_size;
-	gp_mem = ROUND2PAGE(gp_mem);
-    }
+    gp_shc = gp_mem;
+    register_mem(vm, vm->exec_deps[0].exec[0].mm, &gp_mem, vm->exec_deps[0].exec[0].mm_size);
     // i = 0 is the shared_user_code
-    for(i = vm->start_lib_idx; i < vm->num_exec; i++) {
+    init_i = 1;
+    for(i = init_i; i < vm->num_exec; i++) {
 	int num_pages;
 	uint64_t gp_area;
-	{
-	    struct kvm_userspace_memory_region region = {
-		.slot = vm->slot_no++,
-		.flags = 0,
-		.guest_phys_addr = gp_mem,
-		.memory_size = vm->exec[i].mm_size,
-		.userspace_addr = (size_t) vm->exec[i].mm
-	    };
-	    //printf("%d, %08llX, %08llX\n", region.slot, region.guest_phys_addr, region.userspace_addr);
-	    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-		fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
-	    }
-	    gp_area = region.guest_phys_addr;
-	    gp_mem += region.memory_size;
-	    gp_mem = ROUND2PAGE(gp_mem);
-	}
+	gp_area = gp_mem;
+	register_mem(vm, vm->exec_deps[i].exec[0].mm, &gp_mem, vm->exec_deps[i].exec[0].mm_size);
 	//printf("%08lX\n", *(uint64_t *)vm->mm[i]);
-	num_pages = SZ2PAGES(vm->exec[i].mm_size);
-	if(i >= vm->start_user_func_idx) {
-	    fni = i - vm->start_user_func_idx;
-	    vm->metadata->func_info[fni].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
-	    vm->metadata->func_info[fni].stack_load_addr =		\
-		(typeof(vm->metadata->func_info[fni].stack_load_addr))vm->func_prop[i].stack_load_addr;
-	    vm->metadata->func_info[fni].entry_addr			\
-		= (typeof(vm->metadata->func_info[fni].entry_addr))vm->func_prop[i].entry;
-	    *(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
-	    *(uint64_t *)H2G(hv_kmem, gp_pt[1]) = gp_shc | 0x087;
-	    init_j = 2;
-	} else {
-	    init_j = 0; // shared lib dont have shm or shm_uc
-	}
-	
+	num_pages = SZ2PAGES(vm->exec_deps[i].exec[0].mm_size);
+	fni = i - init_i;
+	vm->metadata->func_info[fni].pt_addr = (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
+	vm->metadata->func_info[fni].stack_load_addr =			\
+	    (typeof(vm->metadata->func_info[fni].stack_load_addr))vm->exec_deps[i].func_prop.stack_load_addr;
+	vm->metadata->func_info[fni].entry_addr				\
+	    = (typeof(vm->metadata->func_info[fni].entry_addr))vm->exec_deps[i].func_prop.entry;
+	*(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
+	*(uint64_t *)H2G(hv_kmem, gp_pt[1]) = gp_shc | 0x087;
+	init_j = 2;
 	for(j = init_j; j < num_pages+init_j; j++) {
 	    *(uint64_t *)H2G(hv_kmem, gp_pt[j]) = gp_area | \
 		0x087; // big,X,X,X,X,user,writable,present
@@ -949,7 +949,7 @@ void resolve_dynsyms(struct vm *vm)
     Elf64_Sym *syms;
     struct elf64_file *elf;
 
-#if 1
+#if 0
     //printf("%016lX\n", dynsym(&vm->exec[1].elf, "myfunc")->st_value);
     for(i = 0; i < vm->num_exec; i++) {
 	//print_relocs(&(vm->exec[i].elf));
