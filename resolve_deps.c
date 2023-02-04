@@ -91,17 +91,17 @@ int get_path(char all_paths[], int all_paths_sz, char path[],
     return i;
 }
 
-void init_exec(struct exec_info *e, char *name, uint64_t base_addr)
+void init_exec(struct exec_info *e, char *name, uint16_t p3e)
 {
     int fd;
     char name_mapped[MAX_NAME_LEN + 1];
     struct stat stat;
-    printf("name = %s, %s\n", name, ATARU_LD_FUNC_PATH);
+    //printf("name = %s, %s\n", name, ATARU_LD_FUNC_PATH);
     strcpy(e->name, ATARU_LD_FUNC_PATH);
     strcat(e->name, name);
     strcpy(name_mapped, e->name);
     strcat(name_mapped, STR_MAPPED); // TBD safety check later
-    e->base_addr = base_addr;
+    e->p3e = p3e;
     e->num_dep = 0;
     fd = open(name_mapped, O_RDWR);
     if(fd == -1)
@@ -146,7 +146,7 @@ int gen_deps(struct lib_deps *deps, char *name)
     char buf[MAX_NAME_LEN+1];
     //init_limits(limit_file);
     deps->num_exec = 1;
-    init_exec(&(deps->exec[0]), name, 0x80400000);
+    init_exec(&(deps->exec[0]), name, 2); // fn starts from 0x8000_0000 onwards
     strcpy(buf, ATARU_LD_FUNC_PATH);
     strcat(buf, name);
     strcat(buf, STR_MAPPED);
@@ -167,18 +167,19 @@ int gen_deps(struct lib_deps *deps, char *name)
 		if(idx == jdx)
 		    fatal("This is bad circular dep %d\n", idx);
 		jdx = (deps->num_exec)++;
-		init_exec(&(deps->exec[jdx]), dep_name, (jdx+4)*(0x40000000));
+		init_exec(&(deps->exec[jdx]), dep_name, jdx+3);
 		push_q(&q, jdx);
 	    }
-	    printf("Adding %s as dep of %s\n", dep_name, e->name);
+	    //printf("Adding %s as dep of %s\n", dep_name, e->name);
 	    add_deps(e, jdx);
 	}
     }
-
+/*
     for(i = 0; i < deps->num_exec; i++) {
 	printf("%02d: %s\n", i, deps->exec[i].name);
 	print_deps(deps, &deps->exec[i]);
     }
+*/
 #undef Q_SZ    
 }
 

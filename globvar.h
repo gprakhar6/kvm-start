@@ -16,9 +16,13 @@
 #define MAX_NAME_LEN                     (1023)
 #define STR_MAPPED                       ("_mapped")
 #define STR_PROP                         ("_prop")
-#define NULL_FUNC  (255)
+#define NULL_FUNC                        (255)
+#define SHARED_PAGES                     (1)
+#define PAGES_SHARED_CODE                (1)
+#define FUNC_VA_START                    (0x80000000 + \
+					  (SHARED_PAGES+PAGES_SHARED_CODE)*MB_2) 
+#define LIB_VA_START                     (0x80000000)
 
-#define SHARED_PAGES (1)
 
 #define	 PORT_SERIAL			 (0x3f8)
 #define	 PORT_WAIT_USER_CODE_MAPPING	 (0x3f9)

@@ -7,7 +7,7 @@
 
 struct exec_info {
     char name[MAX_NAME_LEN+1];
-    uint64_t base_addr;
+    uint16_t p3e;
     int dep_list[MAX_DEPS];
     int num_dep;
     struct elf64_file elf;

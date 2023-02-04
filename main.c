@@ -155,6 +155,7 @@ void install_signal_handlers();
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
+void print_hex(uint8_t *a, int sz);
 
 static inline uint64_t tsc()
 {
@@ -706,12 +707,12 @@ int setup_bootcode_mmap(struct vm *vm)
     if(shdr == NULL)
 	fatal("no .kfree_space section found");
     vm->kern_end = shdr->sh_addr; // this better be alined to 4KB
-    printf("kern_end = %ld\n", vm->kern_end / KB_1);
+    //printf("kern_end = %ld\n", vm->kern_end / KB_1);
     shdr = get_shdr(&elf, ".paging");
     if(shdr == NULL)
 	fatal("no .paging section found");
     vm->paging = shdr->sh_addr;
-    printf("paging section start = %08lX\n", vm->paging);
+    //printf("paging section start = %08lX\n", vm->paging);
     //vm->tbls = (typeof(vm->tbls))(vm->kern_end - MAX_VCPUS * sizeof(struct t_pg_tbls));
     //printf("tbls test: %08lX\n", vm->tbls[0].tbl[1].e[3]);
     fini_elf64_file(&elf);
@@ -835,18 +836,34 @@ void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
 	.memory_size = sz,
 	.userspace_addr = (size_t) hva
     };
-    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0)
+    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+	printf("slot = %d, addr = %016lX, sz = %ld, uaddr = %016lX\n",
+	       vm->slot_no-1, *gpa, sz, (uint64_t)hva);
+	if(sz % PAGE_SIZE != 0)
+	    printf("The page size for the exec must be 4k aligned\n");
 	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
+    }
     *gpa += sz;
     *gpa = ROUND2PAGE(*gpa);
+}
+
+void cont_map_p2(uint64_t *pt, uint64_t start_addr, int num_entries)
+{
+    int i;
+    for(i = 0; i < num_entries; i++) {
+	pt[i] = start_addr | 0x087;
+	start_addr + MB_2;
+    }
 }
 // call after copying user data and kern data
 void register_umem_mmap(struct vm *vm)
 {
-    int i, j, init_j, fni, init_i;
+    int i, j, init_pt, fni, init_i, p3i;
     uint64_t *gp_pt; // guest physical page table
     uint64_t gp_mem, gp_shm, gp_shc;
     uint64_t hv_kmem, templ_boot_p3;
+    struct lib_deps *dep;
+    
     gp_mem = vm->kphy_mem_size; // end of k pages
     gp_pt = (uint64_t *)vm->kern_end;
     hv_kmem = (uint64_t)vm->kmem;
@@ -855,47 +872,57 @@ void register_umem_mmap(struct vm *vm)
     register_mem(vm, vm->shared_mem, &gp_mem, SHM_SIZE);
     // register the shared user code
     gp_shc = gp_mem;
-    register_mem(vm, vm->exec_deps[0].exec[0].mm, &gp_mem, vm->exec_deps[0].exec[0].mm_size);
+    register_mem(vm, vm->exec_deps[0].exec[0].mm, &gp_mem,
+		 vm->exec_deps[0].exec[0].mm_size);
     // i = 0 is the shared_user_code
     init_i = 1;
     for(i = init_i; i < vm->num_exec; i++) {
 	int num_pages;
 	uint64_t gp_area;
-	gp_area = gp_mem;
-	register_mem(vm, vm->exec_deps[i].exec[0].mm, &gp_mem, vm->exec_deps[i].exec[0].mm_size);
-	//printf("%08lX\n", *(uint64_t *)vm->mm[i]);
-	num_pages = SZ2PAGES(vm->exec_deps[i].exec[0].mm_size);
-	fni = i - init_i;
-	vm->metadata->func_info[fni].pt_addr = \
-	    (typeof(vm->metadata->func_info[i].pt_addr))(gp_pt);
-	//printf("pt_addr = %016lX\n", vm->metadata->func_info[fni].pt_addr);
-	vm->metadata->func_info[fni].stack_load_addr =			\
-	    (typeof(vm->metadata->func_info[fni].stack_load_addr))\
-	    vm->exec_deps[i].func_prop.stack_load_addr;
-	vm->metadata->func_info[fni].entry_addr				\
-	    = (typeof(vm->metadata->func_info[fni].entry_addr))\
-	    vm->exec_deps[i].func_prop.entry;
-
+	uint64_t *p3, *p2;
 	// copy first 4 entries
 	// templ_boot_p3 is after apic page
 	templ_boot_p3 = hv_kmem + vm->paging + 512 * sizeof(uint64_t);
-	
-	memcpy((void *)H2G(hv_kmem, gp_pt[0]),
-	       (void *)templ_boot_p3,
-	       sizeof(uint64_t) * 4);
-	*(uint64_t *)H2G(hv_kmem, gp_pt[2]) = (uint64_t)(gp_pt + 512) | 0x07;
+	p3 = (typeof(p3))H2G(hv_kmem, gp_pt[0]);
+	memcpy((void *)p3, (void *)templ_boot_p3, 4*sizeof(uint64_t));
+	fni = i - init_i;
+	dep = &(vm->exec_deps[i]);
+	//printf("%08lX\n", *(uint64_t *)vm->mm[i]);
+	vm->metadata->func_info[fni].pt_addr = \
+	    (typeof(vm->metadata->func_info[i].pt_addr))gp_pt;
+	//printf("pt_addr = %016lX\n", vm->metadata->func_info[fni].pt_addr);
+	vm->metadata->func_info[fni].stack_load_addr =			\
+	    (typeof(vm->metadata->func_info[fni].stack_load_addr))\
+	    dep->func_prop.stack_load_addr;
+	vm->metadata->func_info[fni].entry_addr				\
+	    = (typeof(vm->metadata->func_info[fni].entry_addr))\
+	    dep->func_prop.entry;
+
+	for(j = 0; j < dep->num_exec; j++) {
+	    gp_area = gp_mem;
+	    //printf("registering %s\n", dep->exec[j].name);
+	    //printf("    %016lX, %ld\n", gp_mem, dep->exec[j].mm_size);
+	    register_mem(vm, dep->exec[j].mm, &gp_mem,
+			 dep->exec[j].mm_size);
+	    gp_pt += 512;
+	    p2 = (typeof(p2))H2G(hv_kmem, gp_pt[0]);
+	    num_pages = SZ2PAGES(dep->exec[j].mm_size);
+	    if(j == 0) { //for the main function 
+		p2[0] = gp_shm | 0x087;
+		// TBD based on SHARED_PAGES & PAGES_SHARED_CODE
+		p2[1] = gp_shc | 0x087;		
+		init_pt = 2;
+	    }
+	    else { // for its dependent libraries
+		init_pt = 0;
+	    }
+	    p3i = dep->exec[j].p3e; // p3 entry index
+	    if(p3i >= 512)
+		fatal("Crossing the p3 num entires\n");	    
+	    p3[p3i] = (uint64_t)gp_pt | 0x07;
+	    cont_map_p2(&p2[init_pt], gp_area, num_pages);
+	}
 	gp_pt += 512;
-	// this is p2
-	*(uint64_t *)H2G(hv_kmem, gp_pt[0]) = gp_shm | 0x087;
-	*(uint64_t *)H2G(hv_kmem, gp_pt[1]) = gp_shc | 0x087;
-	init_j = 2;
-	for(j = init_j; j < num_pages+init_j; j++) {
-	    *(uint64_t *)H2G(hv_kmem, gp_pt[j]) = gp_area | \
-		0x087; // big,X,X,X,X,user,writable,present
-	    //printf("func %d:num_pages=%d:pt[%d] %08lX\n", i, num_pages, j, *(uint64_t *)H2G(hv_kmem, gp_pt[j]));
-	    gp_area += MB_2;
-	}	
-	gp_pt += 512; // one page table
     }
     /*
       dag repr:
@@ -966,12 +993,152 @@ void register_umem_mmap(struct vm *vm)
     //exit(-1);
 }
 
+// resolve rel with sym in mm, whereas sym belongs to lib
+// mapped at index p3e in p3 page table
+void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
+		  uint8_t *mm_sym, Elf64_Sym *sym, int sym_p3e)
+{
+    uint64_t offset, dep_lib_start;
+    void *src, *dst;
+    int copy_sz;
+    uint64_t value, e_start, sym_e_start, value_va;
+
+    if(mm_p3e == 2)// func special handling than lib
+	e_start = FUNC_VA_START;
+    else
+	e_start = LIB_VA_START;
+
+    if(sym_p3e == 2) {
+	sym_e_start = FUNC_VA_START;
+	dep_lib_start = FUNC_VA_START;
+    }
+    else {
+	sym_e_start = LIB_VA_START;
+	dep_lib_start = (uint64_t)sym_p3e * (uint64_t)0x40000000;
+    }
+    offset = rel->offset;
+
+    printf("%s\n", rel->name);
+    printf("0:offset = %016lX\nvalue = %016lX\ne_start=%016lX\n",
+	   offset, sym->st_value, e_start);
+    
+    offset = rel->offset - e_start;
+    value = sym->st_value - sym_e_start;
+    //printf("dep_lib_start: %016lX, %d\n", dep_lib_start, sym_p3e);
+    value_va = value + dep_lib_start;
+    
+    printf("1:offset = %016lX\nvalue = %016lX\nvalue_va=%016lX\n",
+    offset, value, value_va); 
+    
+    //printf("sym_p3e = %d\n", sym_p3e);
+    dst = (typeof(dst))(&mm[offset]);
+
+    // only global and default i can understand
+    if((ELF64_ST_BIND(sym->st_info) == STB_GLOBAL) &&
+       (ELF64_ST_VISIBILITY(sym->st_other) == STV_DEFAULT)) {
+	switch(ELF64_ST_TYPE(sym->st_info)) {
+	case STT_FUNC:
+	    switch(rel->type) {
+	    case 7: // R_X86_64_JUMP_SLOT
+		src = (typeof(src))&(value_va);
+		copy_sz = 8;
+		//printf("R_X86_64_JUMP_SLOT: value_va = %016lX\n", value_va);
+		break;
+	    default:
+		fatal("Unknown rel->type %d\n", rel->type);
+	    }
+	    break;
+	case STT_OBJECT:
+	    switch(rel->type) {
+	    case 5: // R_X86_64_COPY
+		src = (typeof(src))&(mm_sym[value]);
+		copy_sz = sym->st_size;
+		print_hex(&mm_sym[value], copy_sz);
+		break;
+	    case 6: // R_X86_64_GLOB_DAT
+		src = (typeof(src))&value_va;
+		copy_sz = 8;
+		printf("R_X86_64_GLOB_DAT: value_va = %016lX\n", value_va);
+		break;
+	    default:
+		fatal("Unknown rel->type %d\n", rel->type);
+	    }
+	    //printf("st_value = %016lX\n", value);
+	    break;
+	default:
+	    fatal("Unkown type for sym");
+	}
+    }
+    else {
+	fatal("Unknown bind or vis type for sym\n");
+    }
+    // this resolves ultimately
+    memcpy(dst, src, copy_sz);
+}
 void resolve_dynsyms(struct vm *vm)
 {
-    int i, syms_sz, j, idx;
-    Elf64_Sym *syms;
-    struct elf64_file *elf;
-
+    int i, j, k, idx, dep_idx, dep_p3e;
+    Elf64_Sym *sym;
+    uint8_t *mm_sym;
+    struct elf64_file *elf, *elfd;
+    struct exec_info *e;
+    struct lib_deps *dep;
+    relocs_t rel;
+    
+    for(i = 0; i < vm->num_exec; i++) {
+	dep = &(vm->exec_deps[i]);
+	for(j = 0; j < dep->num_exec; j++) {
+	    e = &(dep->exec[j]);
+	    elf = &(e->elf);
+	    idx = 0;
+	    while(iterate_rel(elf, &rel, &idx) != -1) {
+		if(rel.type == 6) { // R_X86_64_GLOB_DAT
+		    /* this type requires that, first search
+		       in the parent exec, if it has the symbol
+		       in the dynsym resolve with that
+		       else resolve with the st_value within
+		       its own dynsym. wierd. but thats how it
+		       works
+		    */
+		    // consider main exec as dep and search for sym
+		    elfd = &(dep->exec[0].elf);
+		    sym = dynsym(elfd, rel.name);
+		    if(sym == (typeof(sym))-1) {
+			dep_p3e = e->p3e;
+			sym = rel.dynsym; // resolve with itself
+			mm_sym = e->mm;
+		    }
+		    else {
+			dep_p3e = 2;
+			mm_sym = dep->exec[0].mm;
+		    }
+		    printf("resolve_glob\n");
+		    resolve_this(e->mm, &rel, e->p3e, mm_sym,
+				 sym, dep_p3e);
+		    continue; // check next rel
+		}
+		for(k = 0; k < e->num_dep; k++) {
+		    dep_idx = e->dep_list[k];
+		    elfd = &(dep->exec[dep_idx].elf);
+		    mm_sym = dep->exec[dep_idx].mm;
+		    sym = dynsym(elfd, rel.name);
+		    if(sym == (typeof(sym))-1)
+			continue;
+		    // this dep may be also referring to the rel
+		    // check next dep if it has the appropriate symbol
+		    if(sym->st_value == 0)
+			continue;
+		    printf("resolv gen\n");
+		    resolve_this(e->mm, &rel, e->p3e, mm_sym, sym,
+				 dep->exec[dep_idx].p3e);
+		    goto next_sym;
+		}
+		fatal("symbol %s of %s not found in any dep\n", rel.name, e->name);
+	    next_sym:
+		continue;
+	    }
+	}
+    }
 #if 0
     //printf("%016lX\n", dynsym(&vm->exec[1].elf, "myfunc")->st_value);
     for(i = 0; i < vm->num_exec; i++) {
@@ -1190,4 +1357,18 @@ void install_signal_handlers()
     sigaction(SIGINT, NULL, &old_action);
     sigaction(SIGINT, &new_action, NULL);
     */
+}
+
+void print_hex(uint8_t *a, int sz)
+{
+    int i;
+    for(i = 0; i < sz; i++) {
+	if(i % 8 == 0)
+	    printf("%04X: ", 0);
+	printf("%02X ", a[i]);
+	if((i+1)%8 == 0)
+	    printf("\n");
+    }
+    if(!((i % 8) == 0))
+	printf("\n");
 }
