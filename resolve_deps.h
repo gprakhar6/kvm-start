@@ -6,6 +6,7 @@
 #include "typedef.h"
 
 struct exec_info {
+    char filename[MAX_NAME_LEN+1];
     char name[MAX_NAME_LEN+1];
     uint16_t p3e;
     int dep_list[MAX_DEPS];

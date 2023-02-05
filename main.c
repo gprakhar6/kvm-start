@@ -918,7 +918,8 @@ void register_umem_mmap(struct vm *vm)
 	    }
 	    p3i = dep->exec[j].p3e; // p3 entry index
 	    if(p3i >= 512)
-		fatal("Crossing the p3 num entires\n");	    
+		fatal("Crossing the p3 num entires\n");
+	    //printf("Mapping %s to p3i=%d\n", dep->exec[j].name, p3i);
 	    p3[p3i] = (uint64_t)gp_pt | 0x07;
 	    cont_map_p2(&p2[init_pt], gp_area, num_pages);
 	}
@@ -1018,7 +1019,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
     }
     offset = rel->offset;
 
-    printf("%s\n", rel->name);
+    printf("%s, mm_p3e = %d,dep_lib_start = %016lX\n", rel->name, mm_p3e, dep_lib_start);
     printf("0:offset = %016lX\nvalue = %016lX\ne_start=%016lX\n",
 	   offset, sym->st_value, e_start);
     
@@ -1042,7 +1043,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 	    case 7: // R_X86_64_JUMP_SLOT
 		src = (typeof(src))&(value_va);
 		copy_sz = 8;
-		//printf("R_X86_64_JUMP_SLOT: value_va = %016lX\n", value_va);
+		printf("R_X86_64_JUMP_SLOT: value_va = %016lX\n", value_va);
 		break;
 	    default:
 		fatal("Unknown rel->type %d\n", rel->type);
@@ -1053,6 +1054,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 	    case 5: // R_X86_64_COPY
 		src = (typeof(src))&(mm_sym[value]);
 		copy_sz = sym->st_size;
+		printf("R_X86_64_COPY: copy_sz = %d\n", copy_sz);
 		print_hex(&mm_sym[value], copy_sz);
 		break;
 	    case 6: // R_X86_64_GLOB_DAT
@@ -1087,8 +1089,10 @@ void resolve_dynsyms(struct vm *vm)
     
     for(i = 0; i < vm->num_exec; i++) {
 	dep = &(vm->exec_deps[i]);
+	printf("Resolving: %s\n", dep->exec[0].name);
 	for(j = 0; j < dep->num_exec; j++) {
 	    e = &(dep->exec[j]);
+	    printf("    resolving %s\n", e->name);
 	    elf = &(e->elf);
 	    idx = 0;
 	    while(iterate_rel(elf, &rel, &idx) != -1) {
