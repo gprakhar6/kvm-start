@@ -130,7 +130,7 @@ struct vm {
 };
 
 const char limit_file[] = "../elf-reader/limits.txt";
-
+const char smap_file_name[] = "smap_dump.txt";
 static int pktcnt = 0;
 static struct timeval t1, t2;
 static uint64_t tsc_t1, tsc_t2;
@@ -138,6 +138,10 @@ static double tsc2ts;
 static sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
 static sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
 char *ATARU_LD_FUNC_PATH;
+int runtime_vcpus = 1;
+static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'";
+static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}'";
+static char str_sys_cmd[1024];
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
@@ -156,6 +160,7 @@ void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 void print_hex(uint8_t *a, int sz);
+void dump_self_smaps();
 
 static inline uint64_t tsc()
 {
@@ -176,6 +181,15 @@ int main(int argc, char *argv[])
     switch(argc) {
     case 0:
     case 1:
+	break;
+    case 3:
+	if(strcmp(argv[1], "vcpu") == 0) {
+	    if(sscanf(argv[2], "%d", &runtime_vcpus) != 1) {
+		printf("provide numeric argument to vcpu\n");
+		exit(-1);
+	    }
+	    printf("vcpu num = %d\n", runtime_vcpus);
+	}
 	break;
     default:
 	if(strcmp(argv[1], "timeit") == 0) {
@@ -207,26 +221,27 @@ int main(int argc, char *argv[])
         fatal("listen failed\n");
     }
     printf("(after funcs mmap)\nprivate_clean + private_dirty + private_hugetlb(kB):\n");
-    system("cat /proc/self/smaps  | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'");    
+    fflush(stdout);
+    dump_self_smaps();
+    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
+    system(str_sys_cmd);
 read_again:
     clifd = accept(sockfd, (struct sockaddr *)&cli, &len);
     len = 100;
     while(read(clifd, buf, len) <= 0);
     ts(t1);
     if(fork() != 0) {
-	//close(clifd);
-	//while(1);
+	close(clifd);
 	goto read_again;
     }
     else {
-	vm.pid = getpid();
-	printf("pid = %d\n", vm.pid);
 	close(sockfd);
+	vm.pid = getpid();
+	//printf("pid = %d\n", vm.pid);
     }
-
     get_vm(&vm); // 500 us    
     register_kmem(&vm);
-    vm.ncpu = 1;
+    vm.ncpu = runtime_vcpus;
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
     register_umem_mmap(&vm);
     sem_post(&sem_usercode_loaded);    
@@ -269,10 +284,16 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	if(pktcnt == 0) {
 	    ts(t2);
 	    printf("Boot time = %lu us\n", dt(t2,t1));
+	    //exit(-1);
 	    printf("private_clean + private_dirty + private_hugetlb(kB):\n");
-	    system("cat /proc/self/smaps  | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'");
+	    fflush(stdout);
+	    dump_self_smaps();
+	    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
+	    system(str_sys_cmd);
 	    printf("pss(kB):\n");
-	    system("cat /proc/self/smaps | grep -i '^pss' | awk '//{s+=$2}END{print s}'");
+	    fflush(stdout);
+	    sprintf(str_sys_cmd, sprintf_cmd_pss, smap_file_name);
+	    system(str_sys_cmd);
 	    tsc_t1 = tsc();
 	    ts(t1);
 	}
@@ -1378,4 +1399,25 @@ void print_hex(uint8_t *a, int sz)
     }
     if(!((i % 8) == 0))
 	printf("\n");
+}
+
+void dump_self_smaps()
+{
+    int by;
+    FILE *fp, *fpw;
+    char line[1024];
+    fp = fopen("/proc/self/smaps", "r");
+    if(fp == NULL)
+	fatal("cant open smaps\n");
+
+    fpw = fopen(smap_file_name, "w");
+    if(fpw == NULL)
+	fatal("cant write smap dump\n");
+
+    while((by = fread(line, 1, sizeof(line), fp)) > 0) {
+	fwrite(line, 1, by, fpw);
+    }
+    fclose(fp);
+    fclose(fpw);
+    
 }

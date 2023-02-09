@@ -3,3 +3,4 @@ main
 perf*
 *.swp
 tmp/*
+smap_dump.txt
