@@ -168,7 +168,7 @@ int gen_deps(struct lib_deps *deps, char *name)
 		if(idx == jdx)
 		    fatal("This is bad circular dep %d\n", idx);
 		jdx = (deps->num_exec)++;
-		printf("new dep %s\n at %d\n", dep_name, jdx+3);
+		//printf("new dep %s\n at %d\n", dep_name, jdx+3);
 		init_exec(&(deps->exec[jdx]), dep_name, jdx+3);
 		push_q(&q, jdx);
 	    }
@@ -229,7 +229,7 @@ int in_exec_info(struct lib_deps *deps, char *dep_name)
     int ret, i;
     ret = -1;
     for(i = 0; i < deps->num_exec; i++) {
-	printf("cmp %s, %s\n", deps->exec[i].filename, dep_name);
+	//printf("cmp %s, %s\n", deps->exec[i].filename, dep_name);
 	if(strcmp(deps->exec[i].filename, dep_name) == 0) {
 	    ret = i;
 	    break;
