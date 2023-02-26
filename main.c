@@ -1,9 +1,11 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sched.h>
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -75,6 +77,7 @@ typedef struct
     struct kvm_cpuid2 *cpuid2;
     uint64_t entry;
     uint64_t stack_start;
+    struct t_metadata **metadata;
     uint8_t **shared_mem;
     int *clifd;
     int *sock_f, *sockaddr_f_len, *buflen;
@@ -133,15 +136,18 @@ const char limit_file[] = "../elf-reader/limits.txt";
 const char smap_file_name[] = "smap_dump.txt";
 static int pktcnt = 0;
 static struct timeval t1, t2;
+static struct timeval t1_net, t2_net;
 static uint64_t tsc_t1, tsc_t2;
 static double tsc2ts;
 static sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
 static sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
 char *ATARU_LD_FUNC_PATH;
-int runtime_vcpus = 1;
+int isol_core_start = 12;
+int runtime_vcpus = 1, runtime_pcpus = 1;
+static char str_sys_cmd[1024];
+
 static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'";
 static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}'";
-static char str_sys_cmd[1024];
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
@@ -173,33 +179,36 @@ struct vm vm;
 int main(int argc, char *argv[])
 {
     int i, ret;
-    int time_the_fork = 0;
     int sockfd, itrue, clifd, len;
     struct sockaddr_in servaddr, cli;
     int server_port = SERVER_PORT, max_listen = MAX_LISTEN;
     char buf[128];
-    switch(argc) {
-    case 0:
-    case 1:
-	break;
-    case 3:
-	if(strcmp(argv[1], "vcpu") == 0) {
-	    if(sscanf(argv[2], "%d", &runtime_vcpus) != 1) {
-		printf("provide numeric argument to vcpu\n");
+    
+    for(i = 1; i < argc;) {
+	if(strcmp(argv[i], "vcpu") == 0) {
+	    if(i+1 >= argc)
+		fatal("provide option for %s\n", argv[i]);
+	    if(sscanf(argv[i+1], "%d", &runtime_vcpus) != 1) {
+		printf("provide numeric argument to %s\n", argv[i]);
 		exit(-1);
 	    }
-	    printf("vcpu num = %d\n", runtime_vcpus);
+	    printf("%s num = %d\n", argv[i], runtime_vcpus);
+	    i+=2;
+	    continue;
 	}
-	break;
-    default:
-	if(strcmp(argv[1], "timeit") == 0) {
-	    printf("Timing the fork to boot time\n");
-	    time_the_fork = 1;
-	    printf("Not supported flag as of now\n");
-	    exit(-1);
-	}
-	break;
+	if(strcmp(argv[i], "pcpu") == 0) {
+	    if(i+1 >= argc)
+		fatal("provide option for %s\n", argv[i]);
+	    if(sscanf(argv[i+1], "%d", &runtime_pcpus) != 1) {
+		printf("provide numeric argument to %s\n", argv[i]);
+		exit(-1);
+	    }
+	    printf("%s num = %d\n", argv[i], runtime_pcpus);
+	    i+=2;
+	    continue;
+	}	
     }
+    
     init_limits(limit_file);
     setup_bootcode_mmap(&vm); // 750 us
     setup_usercode_mmap(&vm); // 290 us
@@ -252,7 +261,8 @@ read_again:
     //pthread_join(vm.tid_tmr, NULL);
     //printf("Timer thread joined\n");
 
-    install_signal_handlers();
+    //printf("Installing signal handler\n");
+    //install_signal_handlers();
     for(i = 0; i < vm.ncpu; i++)
 	pthread_join(vm.vcpu[i].tid, NULL);
     printf("All cpu thread joined\n");
@@ -264,7 +274,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
     int i;
     int ret = 0, len;
     int buflen;
-    
+    static double net_time = 0.0;
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
 	for(i = 1; i < vcpu->pool_size; i++)
@@ -295,6 +305,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    sprintf(str_sys_cmd, sprintf_cmd_pss, smap_file_name);
 	    system(str_sys_cmd);
 	    tsc_t1 = tsc();
+	    //printf("ts(t1)\n");
 	    ts(t1);
 	}
 	//printf("shm = %d\n", *(int *)*(vcpu->shared_mem));
@@ -316,7 +327,11 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    msg.msg_control = NULL;
 	    msg.msg_controllen = 0;
 	    msg.msg_flags = 0;
+
+	    ts(t1_net);
 	    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
+	    ts(t2_net);
+	    net_time += dt(t2_net, t1_net);
 	    //printf("buflen = %d\n", buflen);
 	    /*
 	    printf("shm: ");
@@ -348,14 +363,20 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//printf("%d: %d\n",buflen,pktcnt);
 	if(pktcnt >= 1000000) {
 	    ts(t2);
+	    //printf("ts(t1)\n");
 	    tsc_t2 = tsc();
 	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);
 	    pdt();
 	    //printf("tsc2ts = %lf, tsc_t1 = %lu, ts_t2 = %lu, sub=%lu\n", tsc2ts, tsc_t1, tsc_t2, tsc_t2 - tsc_t1);
+	    printf("avg dag_ts = %lf us, %ld\n", (*(vcpu->metadata))->dag_ts * tsc2ts, (*(vcpu->metadata))->dag_n);
+	    printf("avg dag_ts = %lf us\n",
+		   ((*(vcpu->metadata))->dag_ts /
+		    (*(vcpu->metadata))->dag_n) * tsc2ts);
 	    for(i = 0; i < 3; i++) {
 		struct t_shm *shm = (struct t_shm *)(*(vcpu->shared_mem));
 		printf("fndt[%d] = %lf\n", i, ((double)shm->fndt[i]) * tsc2ts);
 	    }
+	    printf("net_time = %lf\n", net_time);
 	    exit(-1);
 	}
 	/*
@@ -534,11 +555,32 @@ void register_kmem(struct vm *vm)
 
 void *create_vcpu(void *vvcpu)
 {
+    int i;
     t_vcpu *vcpu = vvcpu;
     int ret;
     struct kvm_lapic_state lapic_state;
     struct kvm_mp_state mp_state;
-
+    pthread_t pid;
+    int core_id;
+    cpu_set_t cpuset;
+    
+    CPU_ZERO(&cpuset);
+    /* 
+    // depend on linux sched for affinity within pcpus
+    core_id = isol_core_start;
+    for(i = 0; i < runtime_pcpus; i++) {
+	CPU_SET(core_id, &cpuset);
+	//printf("core_id = %d\n", core_id);
+	core_id += 1;
+    }
+    */
+    // distribute eventy, 1 core per pcpu
+    core_id = isol_core_start + (vcpu->id) % runtime_pcpus;
+    CPU_SET(core_id, &cpuset);
+    // pin cpu thread to a cpu set
+    if(pthread_setaffinity_np(vcpu->tid, sizeof(cpuset), &cpuset))
+	fatal("pthread_setaffinity_np failed, pinning\n");
+    
     //ts(t1);
 #ifdef __IRQCHIP__
     if(ioctl(vcpu->vcpufd, KVM_GET_LAPIC, &lapic_state)) {
@@ -665,6 +707,7 @@ void setup_vcpus(struct vm *vm)
 	vm->vcpu[i].stack_start = vm->stack_start - ((i) * PAGE_SIZE);
 	vm->vcpu[i].pool_size = vm->ncpu;
 	vm->vcpu[i].shared_mem = &(vm->shared_mem);
+	vm->vcpu[i].metadata = &(vm->metadata);
 	vm->vcpu[i].clifd = &(vm->clifd);
 	vm->vcpu[i].sock_f = &(vm->sock_f);
 	vm->vcpu[i].saddr_f = &(vm->saddr_f);
@@ -813,6 +856,8 @@ int setup_usercode_mmap(struct vm *vm)
 int setup_usercode_mmap(struct vm *vm)
 {
     int i;
+
+    /*
     struct exec_path_name u_exec[] = {
 	{.path = "/home/prakhar/data/code/shared_user_code/",
 	 .name = "shared_user_code"
@@ -830,6 +875,50 @@ int setup_usercode_mmap(struct vm *vm)
 	 .name = ""
 	}
     };
+    */
+    
+    struct exec_path_name u_exec[] = {
+	{.path = "/home/prakhar/data/code/shared_user_code/",
+	 .name = "shared_user_code"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},
+	{.path = "/home/prakhar/data/code/null_fn/",
+	 .name = "main"
+	},	
+	{.path = "",
+	 .name = ""
+	}
+    };
+    
     assert(sizeof(u_exec) < sizeof(vm->exec_deps));
     vm->shared_mem =						\
 	(uint8_t *)mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, \
@@ -982,37 +1071,23 @@ void register_umem_mmap(struct vm *vm)
         \   /
           2
     */
-    vm->metadata->num_nodes = 3;
+    vm->metadata->num_nodes = 11;
     {
+
 	/*
 	uint16_t tmp_arr[] = {
-	    0,1,1,2,1,0,2,4,5,5,5,1,2,3,4,3,
+	    0,1,1,0,1,2,2,1,2,
 	};
 	*/
+	
 	uint16_t tmp_arr[] = {
-	    0,1,1,0,1,2,2,1,2,
-	};		
+	    0,1,1,1,2,3,1,2,1,1,3,0,3,4,6,8,9,10,13,14,15,16,16,1,2,3,4,4,5,5,6,7,7,5,8,9,10,10,10,
+	};
+	
 	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
     }
-    /*
-    vm->metadata->dag[0] = 0; // in nodes 0
-    vm->metadata->dag[1] = 1; // in nodes 1
-    vm->metadata->dag[2] = 1; // in nodes 2
-    vm->metadata->dag[3] = 2; // in nodes 3
-    vm->metadata->dag[4] = 0;
-    vm->metadata->dag[5] = 2;
-    vm->metadata->dag[6] = 3;
-    vm->metadata->dag[7] = 4;
-    vm->metadata->dag[8] = 4;
-    vm->metadata->dag[9] = 1; // out 0
-    vm->metadata->dag[10] = 2;
-    vm->metadata->dag[11] = 3; // out 1
-    vm->metadata->dag[12] = 3; // out 2
-    vm->metadata->dag[13] = 0; // out 3
-    */
     memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
-    vm->metadata->start_func = 0;    
-    //exit(-1);
+    vm->metadata->start_func = 0;
 }
 
 // resolve rel with sym in mm, whereas sym belongs to lib
@@ -1378,13 +1453,13 @@ void sigint_handler(int signum)
 void install_signal_handlers()
 {
     struct sigaction new_action, old_action;
-    /*
+    
     new_action.sa_handler = sigint_handler;
     sigemptyset(&new_action.sa_mask);
     new_action.sa_flags = 0;
     sigaction(SIGINT, NULL, &old_action);
     sigaction(SIGINT, &new_action, NULL);
-    */
+    
 }
 
 void print_hex(uint8_t *a, int sz)

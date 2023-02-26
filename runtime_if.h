@@ -29,6 +29,7 @@ struct t_metadata {
     uint64_t num_active_cpus;
     uint8_t current[64];
     t_sched_status sched_status;
+    uint64_t dag_ts, dag_n;
     uint8_t num_nodes;
     uint8_t start_func;
     uint16_t dag[MAX_DAG_ARR_SZ];
