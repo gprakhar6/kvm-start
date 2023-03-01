@@ -146,12 +146,16 @@ int isol_core_start = 12;
 int runtime_vcpus = 1, runtime_pcpus = 1;
 static char str_sys_cmd[1024];
 
+static uint64_t gp2hv[NR_GP2HV];
+#define GP2HV(x)  (gp2hv[((x) >> 21)] + ((x) & (MB_2 - 1)))
+
 static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'";
 static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}'";
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
-void register_kmem(struct vm *vm);
+void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
+		  uint64_t sz);
 void setup_vcpus(struct vm *vm);
 int setup_bootcode_mmap(struct vm *vm);
 void snapshot_vm(struct vm *vm);
@@ -160,13 +164,14 @@ void resolve_dynsyms(struct vm *vm);
 void register_umem_mmap(struct vm *vm);
 void setup_irqfd(struct vm *vm, uint32_t gsi);
 void setup_device_loop(struct vm *vm);
-int print_regs(t_vcpu *vm);
+int print_regs(t_vcpu *vcpu);
 void install_signal_handlers();
 void print_cpuid_output(struct kvm_cpuid2 *cpuid2);
 void print_lapic_state(struct kvm_lapic_state *lapic);
 Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 void print_hex(uint8_t *a, int sz);
 void dump_self_smaps();
+uint64_t guest2host(uint64_t cr3, uint64_t addr);
 
 static inline uint64_t tsc()
 {
@@ -183,6 +188,7 @@ int main(int argc, char *argv[])
     struct sockaddr_in servaddr, cli;
     int server_port = SERVER_PORT, max_listen = MAX_LISTEN;
     char buf[128];
+    uint64_t gpa;
     
     for(i = 1; i < argc;) {
 	if(strcmp(argv[i], "vcpu") == 0) {
@@ -248,8 +254,9 @@ read_again:
 	vm.pid = getpid();
 	//printf("pid = %d\n", vm.pid);
     }
-    get_vm(&vm); // 500 us    
-    register_kmem(&vm);
+    get_vm(&vm); // 500 us
+    gpa = 0;
+    register_mem(&vm, vm.kmem, &gpa, vm.kphy_mem_size);
     vm.ncpu = runtime_vcpus;
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
     register_umem_mmap(&vm);
@@ -392,12 +399,87 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
     return ret;
 }
 
+// takes guest physica cr3, guest virt addr
+// returns hv address
+void* pt_walk(uint64_t cr3, uint64_t addr)
+{
+    uint64_t off, p4e, p3e, p2e, e;
+
+    //printf("cr3 = %016lX\n", (uint64_t)cr3);
+    //printf("hv-cr3 = %016lX\n", (uint64_t)GP2HV(cr3));
+    off = (addr >> 39) & 0x1FF;
+    p4e = *((uint64_t *)GP2HV(cr3) + off);
+    //printf("p4e = %016lX, off = %ld\n", p4e, off);
+    p4e = p4e & (~(KB_4-1));
+
+    off = (addr >> 30) & 0x1FF;
+    p3e = *((uint64_t *)GP2HV(p4e) + off);
+    //printf("p3e = %016lX, off = %ld\n", p3e, off);
+    p3e = p3e & (~(KB_4-1));
+
+    off = (addr >> 21) & 0x1FF;
+    p2e = *((uint64_t *)GP2HV(p3e) + off);
+    //printf("p2e = %016lX, off = %ld\n", p2e, off);
+    p2e = p2e & (~(KB_4-1));
+
+    e = GP2HV(p2e);
+    return (void *)(e + (addr & (MB_2-1)));
+    
+}
+void handle_syscall(t_vcpu *vcpu, uint16_t nr)
+{
+    int ret;
+    uint64_t rax, rdi, rsi, rcx, rdx, r8, r9;
+    uint64_t cr3, cr3_hv;
+    ret = ioctl(vcpu->vcpufd, KVM_GET_REGS, &vcpu->regs);
+    if(ret == -1)
+	fatal("cant read regs\n");
+    ret = ioctl(vcpu->vcpufd, KVM_GET_SREGS, &vcpu->sregs);
+    if(ret == -1)
+	fatal("cant read sregs\n");
+    
+    rdi = vcpu->regs.rdi;
+    rsi = vcpu->regs.rsi;
+    rcx = vcpu->regs.rcx;
+    rdx = vcpu->regs.rdx;
+    r8  = vcpu->regs.r8;
+    r9  = vcpu->regs.r9;
+    cr3 = vcpu->sregs.cr3;
+
+    switch(nr) {
+    case 11:
+	rax = printf((char *)pt_walk(cr3, rdi),
+		     (char *)pt_walk(cr3, rsi));
+	break;
+    }
+    vcpu->regs.rax = rax;
+    ret = ioctl(vcpu->vcpufd, KVM_SET_REGS, &vcpu->regs);
+    if(ret == 1)
+	fatal("error setting regs");
+    printf("syscall nr:%d\n", nr);
+
+    printf("rdi    = 0x%016lx\n", rdi);
+    printf("rsi    = 0x%016lx\n", rsi);
+    printf("rcx    = 0x%016lx\n", rdx);
+    printf("rdx    = 0x%016lx\n", rcx);
+    printf("r8     = 0x%016lx\n", r8);
+    printf("r9     = 0x%016lx\n", r9);
+}
+
 static inline int handle_io_port(t_vcpu *vcpu)
 {
     char c;
     int ret;
-
+    uint16_t nr;
+    
     switch(vcpu->run->io.port) {
+    case PORT_SYSCALL:
+	if (vcpu->run->io.direction == KVM_EXIT_IO_OUT &&
+	    vcpu->run->io.size == 2 && vcpu->run->io.count == 1) {
+	    nr = *(uint16_t *)(((uint8_t *)vcpu->run) + vcpu->run->io.data_offset);
+	    handle_syscall(vcpu, nr);
+	}
+	break;
     case PORT_SERIAL: /* for the printf function */
 	if (vcpu->run->io.direction == KVM_EXIT_IO_OUT &&
 	    vcpu->run->io.size == 1 && vcpu->run->io.count == 1) {
@@ -539,20 +621,6 @@ int get_vm(struct vm *vm)
     return err;
 }
 
-void register_kmem(struct vm *vm)
-{
-    struct kvm_userspace_memory_region region = {
-	.slot = vm->slot_no++,
-	.flags = 0,
-	.guest_phys_addr = 0,
-	.memory_size = vm->kphy_mem_size,
-	.userspace_addr = (size_t) vm->kmem
-    };
-    if(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)");
-    }    
-}
-
 void *create_vcpu(void *vvcpu)
 {
     int i;
@@ -574,6 +642,7 @@ void *create_vcpu(void *vvcpu)
 	core_id += 1;
     }
     */
+    
     // distribute eventy, 1 core per pcpu
     core_id = isol_core_start + (vcpu->id) % runtime_pcpus;
     CPU_SET(core_id, &cpuset);
@@ -939,6 +1008,7 @@ int setup_usercode_mmap(struct vm *vm)
 void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
 		  uint64_t sz)
 {
+    int idx, idx_e;
     struct kvm_userspace_memory_region region = {
 	.slot = vm->slot_no++,
 	.flags = 0,
@@ -953,8 +1023,18 @@ void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
 	    printf("The page size for the exec must be 4k aligned\n");
 	fatal("ioctl(KVM_SET_USER_MEMORY_REGION)\n");
     }
+    //printf("%016lX -> %016lX\n", (uint64_t)*gpa, (uint64_t)hva);
+    idx = *gpa / MB_2;
     *gpa += sz;
     *gpa = ROUND2PAGE(*gpa);
+    idx_e = *gpa / MB_2;
+    if(idx_e >= NR_GP2HV)
+	fatal("Crossed physical possible size for guest\n");
+    gp2hv[idx] = (uint64_t)hva;
+    idx++;
+    for(;idx < idx_e; idx++) {
+	gp2hv[idx] = MB_2 + gp2hv[idx-1];
+    }
 }
 
 void cont_map_p2(uint64_t *pt, uint64_t start_addr, int num_entries)
@@ -984,6 +1064,8 @@ void register_umem_mmap(struct vm *vm)
     gp_shc = gp_mem;
     register_mem(vm, vm->exec_deps[0].exec[0].mm, &gp_mem,
 		 vm->exec_deps[0].exec[0].mm_size);
+    templ_boot_p3 = hv_kmem + vm->paging + 512 * sizeof(uint64_t);
+    //printf("boot_p4 = %016lX\n",templ_boot_p3+512 * sizeof(uint64_t));
     // i = 0 is the shared_user_code
     init_i = 1;
     for(i = init_i; i < vm->num_exec; i++) {
@@ -992,7 +1074,6 @@ void register_umem_mmap(struct vm *vm)
 	uint64_t *p3, *p2;
 	// copy first 4 entries
 	// templ_boot_p3 is after apic page
-	templ_boot_p3 = hv_kmem + vm->paging + 512 * sizeof(uint64_t);
 	p3 = (typeof(p3))H2G(hv_kmem, gp_pt[0]);
 	memcpy((void *)p3, (void *)templ_boot_p3, 4*sizeof(uint64_t));
 	fni = i - init_i;

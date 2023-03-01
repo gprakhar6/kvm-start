@@ -9,3 +9,4 @@ perf:
 
 rperf:
 	sudo chown prakhar:prakhar perf.data
+	perf script > perf.out
