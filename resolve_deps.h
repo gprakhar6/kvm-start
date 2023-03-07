@@ -14,12 +14,12 @@ struct exec_info {
     struct elf64_file elf;
     uint8_t *mm;
     uint32_t mm_size;
+    struct func_prop func_prop;
 };
 
 struct lib_deps {
     struct exec_info exec[MAX_DEPS];
     int num_exec;
-    struct func_prop func_prop;
 };
 
 int gen_deps(struct lib_deps *deps, char *name);
