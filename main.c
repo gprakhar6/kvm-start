@@ -45,6 +45,7 @@
 #define PAGE_MASK (0x1FFFFF)
 
 #define SHM_SIZE (MB_2 * SHARED_PAGES)
+#define SHARED_RO_SIZE (MB_2 * PAGES_SHARED_RO)
 
 #define SZ2PAGES(x) (((x) + MB_2 - 1) / MB_2)
 #define ROUND2PAGE(x) (SZ2PAGES(x) * MB_2)
@@ -124,6 +125,7 @@ struct vm {
     int tmr_eventfd;
     uint8_t *shared_mem;
     uint8_t *shared_user_code;
+    uint8_t *shared_ro;
     int clifd;
     int sock_f, sockaddr_f_len;
     struct sockaddr saddr_f;
@@ -931,6 +933,22 @@ int setup_usercode_mmap(struct vm *vm)
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if(vm->shared_mem == MAP_FAILED)
 	fatal("shared mapping failed\n");
+    
+    vm->shared_ro =						\
+	(uint8_t *)mmap(NULL, SHARED_RO_SIZE, PROT_READ | PROT_WRITE,	\
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(vm->shared_ro == MAP_FAILED)
+	fatal("shared ro mapping failed\n");
+
+    for(i = 0; i < 1024; i++) {
+	if(i%2 == 0)
+	    vm->shared_ro[i] = 0xaa;
+	if(i%2 == 1)
+	    vm->shared_ro[i] = 0x55;	
+    }
+    if(mprotect(vm->shared_ro, SHARED_RO_SIZE, PROT_READ))
+	fatal("unable to update shared_ro PROT bits\n");
+    
     vm->num_exec = 0;
     for(i = 0; i < ARR_SZ_1D(vm->exec_deps); i++) {
 	if(u_exec[i].name[0] == '\0')
@@ -974,11 +992,12 @@ void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
     }
 }
 
-void cont_map_p2(uint64_t *pt, uint64_t start_addr, int num_entries)
+void cont_map_p2(uint64_t *pt, uint64_t start_addr, int num_entries,
+    uint64_t pg_flags)
 {
     int i;
     for(i = 0; i < num_entries; i++) {
-	pt[i] = start_addr | 0x087;
+	pt[i] = start_addr | pg_flags;
 	start_addr + MB_2;
     }
 }
@@ -987,8 +1006,8 @@ void register_umem_mmap(struct vm *vm)
 {
     int i, j, init_pt, fni, init_i, p3i;
     uint64_t *gp_pt; // guest physical page table
-    uint64_t gp_mem, gp_shm, gp_shc;
-    uint64_t hv_kmem, templ_boot_p3;
+    uint64_t gp_mem, gp_shm, gp_shc, gp_shro;
+    uint64_t hv_kmem, templ_boot_p3, shared_ro_page;
     struct lib_deps *dep;
     
     gp_mem = vm->kphy_mem_size; // end of k pages
@@ -1001,7 +1020,14 @@ void register_umem_mmap(struct vm *vm)
     gp_shc = gp_mem;
     register_mem(vm, vm->exec_deps[0].exec[0].mm, &gp_mem,
 		 vm->exec_deps[0].exec[0].mm_size);
-    templ_boot_p3 = hv_kmem + vm->paging + 512 * sizeof(uint64_t);
+    gp_shro = gp_mem; // shared read only data
+    register_mem(vm, vm->shared_ro, &gp_mem, SHARED_RO_SIZE);
+    templ_boot_p3 = hv_kmem + vm->paging + 2 * 512 * sizeof(uint64_t);
+    shared_ro_page = templ_boot_p3 - 512 * sizeof(uint64_t);
+    // presesent, user, big, 1 GB ro mapping
+    // 4 GB area
+    cont_map_p2((uint64_t *)shared_ro_page, gp_shro,
+		PAGES_SHARED_RO, 0x85);
     //printf("boot_p4 = %016lX\n",templ_boot_p3+512 * sizeof(uint64_t));
     // i = 0 is the shared_user_code
     init_i = 1;
@@ -1049,7 +1075,7 @@ void register_umem_mmap(struct vm *vm)
 		fatal("Crossing the p3 num entires\n");
 	    //printf("Mapping %s to p3i=%d\n", dep->exec[j].name, p3i);
 	    p3[p3i] = (uint64_t)gp_pt | 0x07;
-	    cont_map_p2(&p2[init_pt], gp_area, num_pages);
+	    cont_map_p2(&p2[init_pt], gp_area, num_pages, 0x087);
 	}
 	gp_pt += 512;
     }
