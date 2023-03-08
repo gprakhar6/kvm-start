@@ -1028,8 +1028,8 @@ void register_umem_mmap(struct vm *vm)
 
 	for(j = 0; j < dep->num_exec; j++) {
 	    gp_area = gp_mem;
-	    printf("registering %s\n", dep->exec[j].name);
-	    printf("    %016lX, %d\n", gp_mem, dep->exec[j].mm_size);
+	    //printf("registering %s\n", dep->exec[j].name);
+	    //printf("    %016lX, %d\n", gp_mem, dep->exec[j].mm_size);
 	    register_mem(vm, dep->exec[j].mm, &gp_mem,
 			 dep->exec[j].mm_size);
 	    gp_pt += 512;
@@ -1137,20 +1137,22 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 #endif
     dep_lib_start = (uint64_t)sym_p3e * (uint64_t)GB_1;
     offset = rel->offset;
-    printf("act e_start = %016lX\n", e_start);
-    printf("act sym_e_start = %016lX\n", sym_e_start);  
+    //printf("act e_start = %016lX\n", e_start);
+    //printf("act sym_e_start = %016lX\n", sym_e_start);  
     
-    printf("%s, mm_p3e = %d,dep_lib_start = %016lX\n", rel->name, mm_p3e, dep_lib_start);
+    //printf("%s, mm_p3e = %d,dep_lib_start = %016lX\n", rel->name, mm_p3e, dep_lib_start);
+    /*
     printf("0:offset = %016lX\nvalue = %016lX\ne_start=%016lX\n",
 	   offset, sym->st_value, e_start);
-    
+    */
     offset = rel->offset - e_start;
     value = sym->st_value - sym_e_start;
     //printf("dep_lib_start: %016lX, %d\n", dep_lib_start, sym_p3e);
     value_va = value + dep_lib_start;
-    
-    printf("1:offset = %016lX\nvalue = %016lX\nvalue_va=%016lX\n",
-    offset, value, value_va); 
+/*
+  printf("1:offset = %016lX\nvalue = %016lX\nvalue_va=%016lX\n",
+  offset, value, value_va); 
+*/
     
     
     //printf("sym_p3e = %d\n", sym_p3e);
@@ -1240,15 +1242,15 @@ void resolve_dynsyms(struct vm *vm)
     
     for(i = 0; i < vm->num_exec; i++) {
 	dep = &(vm->exec_deps[i]);
-	printf("Resolving: %s\n", dep->exec[0].name);
+	//printf("Resolving: %s\n", dep->exec[0].name);
 	for(j = 0; j < dep->num_exec; j++) {
 	    e = &(dep->exec[j]);
-	    printf("    resolving %s\n", e->name);
+	    //printf("    resolving %s\n", e->name);
 	    elf = &(e->elf);
-	    print_relocs(elf);
+	    //print_relocs(elf);
 	    idx = 0;
 	    while(iterate_rel(elf, &rel, &idx) != -1) {
-		printf("idx = %d, %016lX\n", idx, rel.addend);
+		//printf("idx = %d, %016lX\n", idx, rel.addend);
 		if(rel.type == 6) { // R_X86_64_GLOB_DAT
 		    /* this type requires that, first search
 		       in the parent exec, if it has the symbol

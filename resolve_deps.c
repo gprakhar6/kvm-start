@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <errno.h>
@@ -148,6 +149,20 @@ void print_deps(struct lib_deps *deps, struct exec_info *e) {
     }
 }
 
+void strip_ver_num(char *name)
+{
+    int i;
+    i = strlen(name) - 1;
+    if(i >= 2 && isdigit(name[i])) {
+	while(name[i] != '.') {
+	    if((--i) == 0)
+		return;
+	}
+	if(i != 0)
+	    name[i] = '\0';
+    }
+}
+
 /*
 exec_info[] -> dep_list[]
 [0] -> 1, 2
@@ -166,7 +181,7 @@ int gen_deps(struct lib_deps *deps, char *name)
     int idx, jdx, i;
     int q_arr[Q_SZ];
     struct exec_info *e;
-    char *dep_name;
+    char *dep_name, dep_name_strip[1024];
     struct lib_queue q;
     char buf[MAX_NAME_LEN+1];
     //init_limits(limit_file);
@@ -179,12 +194,14 @@ int gen_deps(struct lib_deps *deps, char *name)
 	e = &(deps->exec[idx]);
 	i = 0;
 	while((dep_name = iterate_deps(e, &i)) != NULL) {
-	    if((jdx = in_exec_info(deps, dep_name)) == -1) {
+	    strcpy(dep_name_strip, dep_name);
+	    strip_ver_num(dep_name_strip);
+	    if((jdx = in_exec_info(deps, dep_name_strip)) == -1) {
 		if(idx == jdx)
 		    fatal("This is bad circular dep %d\n", idx);
 		jdx = (deps->num_exec)++;
 		//printf("new dep %s\n at %d\n", dep_name, jdx+3);
-		init_exec(&(deps->exec[jdx]), dep_name, jdx+3);
+		init_exec(&(deps->exec[jdx]), dep_name_strip, jdx+3);
 		push_q(&q, jdx);
 	    }
 	    //printf("Adding %s as dep of %s\n", dep_name, e->name);
