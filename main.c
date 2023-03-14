@@ -94,6 +94,8 @@ enum elf_type {
 struct exec_path_name {
     char path[MAX_NAME_LEN + 1];
     char name[MAX_NAME_LEN + 1];
+    uint64_t inp_off;
+    uint64_t out_off;
 };
 struct executable {
     char name[MAX_NAME_LEN+1];
@@ -864,7 +866,7 @@ void snapshot_vm(struct vm *vm)
 int setup_usercode_mmap(struct vm *vm)
 {
     int i;
-
+    uint32_t inp_off, out_off;
     /*
     struct exec_path_name u_exec[] = {
 	{.path = "/home/prakhar/data/code/shared_user_code/",
@@ -887,43 +889,69 @@ int setup_usercode_mmap(struct vm *vm)
     
     struct exec_path_name u_exec[] = {
 	{.path = "/home/prakhar/data/code/shared_user_code/",
-	 .name = "shared_user_code"
+	 .name = "shared_user_code",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,
 	},
 	{.path = "/home/prakhar/data/code/amd_math_test/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},
 	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main"
+	 .name = "main",
+	 .inp_off = 0x1000,
+	 .out_off = 0x2000,	 
 	},	
 	{.path = "",
-	 .name = ""
+	 .name = "",
+	 .inp_off = 0,
+	 .out_off = 0, 
 	}
     };
     
@@ -956,6 +984,14 @@ int setup_usercode_mmap(struct vm *vm)
 	// TBD where to call fin
 	ATARU_LD_FUNC_PATH = u_exec[i].path;
 	gen_deps(&vm->exec_deps[i], u_exec[i].name);
+	inp_off = u_exec[i].inp_off;
+	out_off = u_exec[i].out_off;
+	if(inp_off >= SHM_SIZE
+	    || out_off >= SHM_SIZE)
+	    fatal("The inp(%d) or out(%d) offsets are beyond %d",
+		  inp_off, out_off, SHM_SIZE);
+	vm->exec_deps[i].exec[0].func_prop.inp_off = inp_off;
+	vm->exec_deps[i].exec[0].func_prop.out_off = out_off;	
 	vm->num_exec++;
     }
 }
@@ -1052,6 +1088,11 @@ void register_umem_mmap(struct vm *vm)
 	    = (typeof(vm->metadata->func_info[fni].entry_addr))\
 	    dep->exec[0].func_prop.entry;
 
+	vm->metadata->func_info[fni].inp_off =
+	    (uint64_t)dep->exec[0].func_prop.inp_off;
+	vm->metadata->func_info[fni].out_off =
+	    (uint64_t)dep->exec[0].func_prop.out_off;
+	
 	for(j = 0; j < dep->num_exec; j++) {
 	    gp_area = gp_mem;
 	    //printf("registering %s\n", dep->exec[j].name);

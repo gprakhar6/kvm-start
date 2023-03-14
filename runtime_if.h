@@ -8,6 +8,8 @@ struct t_func_info {
     uint64_t pt_addr;
     uint64_t entry_addr;
     uint64_t stack_load_addr;
+    uint32_t inp_off;
+    uint32_t out_off;
 };
 
 // POI zero it is assumed
