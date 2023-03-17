@@ -10,3 +10,6 @@ perf:
 rperf:
 	sudo chown prakhar:prakhar perf.data
 	perf script > perf.out
+
+get_app_defn:
+	scp prakhar@10.16.70.240:/home/prakhar/data/code/f4/app_defn.h .

@@ -36,6 +36,7 @@ struct t_metadata {
     uint8_t start_func;
     uint16_t dag[MAX_DAG_ARR_SZ];
     uint16_t dag_in_count[MAX_FUNC]; // used by runtime
+    uint32_t dag_func_time[MAX_FUNC];
 };
 
 #endif

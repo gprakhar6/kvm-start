@@ -31,6 +31,7 @@
 #include "sock_flow.h"
 #include "typedef.h"
 #include "resolve_deps.h"
+#include "app_defn.h"
 
 #define __IRQCHIP__
 
@@ -56,7 +57,7 @@
 #define dtsc(y,x) ((y-x)%())
 #define pdt() printf("dt = %ld us\n", dt(t2,t1));
 #define pts(ts) printf("ts = %ld us\n", (ts.tv_sec*1000000 + ts.tv_usec));
-
+#define tr_result(s, b, ...) do {write(s, b, sprintf(b, ##__VA_ARGS__));} while(0);
 struct t_page_table {
     uint64_t e[512];
 };
@@ -151,12 +152,15 @@ char *ATARU_LD_FUNC_PATH;
 int isol_core_start = 12;
 int runtime_vcpus = 1, runtime_pcpus = 1;
 static char str_sys_cmd[1024];
+static char result_buf[1024];
 
 static uint64_t gp2hv[NR_GP2HV];
 #define GP2HV(x)  (gp2hv[((x) >> 21)] + ((x) & (MB_2 - 1)))
+static struct app_defn_t app;
 
 static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'";
 static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}'";
+
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
@@ -178,6 +182,7 @@ Elf64_Shdr* get_shdr(struct elf64_file *elf, char *name);
 void print_hex(uint8_t *a, int sz);
 void dump_self_smaps();
 uint64_t guest2host(uint64_t cr3, uint64_t addr);
+int connect_to(int sock, char ip[], int port);
 
 static inline uint64_t tsc()
 {
@@ -190,10 +195,6 @@ struct vm vm;
 int main(int argc, char *argv[])
 {
     int i, ret;
-    int sockfd, itrue, clifd, len;
-    struct sockaddr_in servaddr, cli;
-    int server_port = SERVER_PORT, max_listen = MAX_LISTEN;
-    char buf[128];
     uint64_t gpa;
     
     for(i = 1; i < argc;) {
@@ -224,42 +225,13 @@ int main(int argc, char *argv[])
     init_limits(limit_file);
     setup_bootcode_mmap(&vm); // 750 us
     setup_usercode_mmap(&vm); // 290 us
-    resolve_dynsyms(&vm);    
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if(sockfd == -1)
-	fatal("Unable to get a socket");
-
-    itrue = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &itrue, sizeof(int));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(server_port);
-    if(bind(sockfd, (struct sockaddr *)&servaddr,
-            sizeof(servaddr)) != 0) {
-	fatal("Unable to bind the socket\n");
-    }
-    if(listen(sockfd, max_listen) != 0) {
-        fatal("listen failed\n");
-    }
+    resolve_dynsyms(&vm);
     printf("(after funcs mmap)\nprivate_clean + private_dirty + private_hugetlb(kB):\n");
     fflush(stdout);
     dump_self_smaps();
     sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
     system(str_sys_cmd);
-read_again:
-    clifd = accept(sockfd, (struct sockaddr *)&cli, &len);
-    len = 100;
-    while(read(clifd, buf, len) <= 0);
-    ts(t1);
-    if(fork() != 0) {
-	close(clifd);
-	goto read_again;
-    }
-    else {
-	close(sockfd);
-	vm.pid = getpid();
-	//printf("pid = %d\n", vm.pid);
-    }
+    // wait for client app connection here
     get_vm(&vm); // 500 us
     gpa = 0;
     register_mem(&vm, vm.kmem, &gpa, vm.kphy_mem_size);
@@ -374,22 +346,48 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	
 	pktcnt++;
 	//printf("%d: %d\n",buflen,pktcnt);
-	if(pktcnt >= 1000000) {
+	if(pktcnt >= 10000) {
+	    int result_sock, wait_s;
 	    ts(t2);
-	    //printf("ts(t1)\n");
 	    tsc_t2 = tsc();
-	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);
-	    pdt();
+	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);	    
+	    if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+		fatal("unable to open result socket\n");
+	    printf("Connecting to %s ip, at port %d\n", app.result_ip,
+		app.result_port);
+	    wait_s = 2;
+	    while(connect_to(result_sock,
+			     app.result_ip,
+			     app.result_port)) {
+		sleep(1);
+		wait_s--;
+		if(wait_s < 0)
+		    fatal("timeout for connecting to result socket\n");
+	    }
+#define TR(...)	tr_result(result_sock, result_buf, ##__VA_ARGS__)
+	    TR("%-8ld ", dt(t2, t1));
 	    //printf("tsc2ts = %lf, tsc_t1 = %lu, ts_t2 = %lu, sub=%lu\n", tsc2ts, tsc_t1, tsc_t2, tsc_t2 - tsc_t1);
-	    printf("avg dag_ts = %lf us, %ld\n", (*(vcpu->metadata))->dag_ts * tsc2ts, (*(vcpu->metadata))->dag_n);
+	    TR("%-8lu ", tsc_t2 - tsc_t1);
+	    //printf("avg dag_ts = %lf us, %ld\n", (*(vcpu->metadata))->dag_ts * tsc2ts, (*(vcpu->metadata))->dag_n);
+	    /*
 	    printf("avg dag_ts = %lf us\n",
 		   ((*(vcpu->metadata))->dag_ts /
 		    (*(vcpu->metadata))->dag_n) * tsc2ts);
-	    for(i = 0; i < 3; i++) {
-		struct t_shm *shm = (struct t_shm *)(*(vcpu->shared_mem));
-		printf("fndt[%d] = %lf\n", i, ((double)shm->fndt[i]) * tsc2ts);
+	    */
+	    TR("%-8lf ",
+		   ((*(vcpu->metadata))->dag_ts /
+		    (*(vcpu->metadata))->dag_n) * tsc2ts);
+	    for(i = 0; i < app.num_nodes; i++) {
+		//struct t_shm *shm = (struct t_shm *)(*(vcpu->shared_mem));
+		//printf("fndt[%d] = %lf\n", i, ((double)shm->fndt[i]) * tsc2ts);
+		TR("%-15lf ", ((double)(*(vcpu->metadata))->dag_func_time[i]) * tsc2ts);
 	    }
-	    printf("net_time = %lf\n", net_time);
+	    //printf("net_time = %lf\n", net_time);
+	    TR("%-8lf ", net_time);
+
+	    TR("\n");
+	    close(result_sock);
+#undef TR	    
 	    exit(-1);
 	}
 	/*
@@ -863,99 +861,66 @@ void snapshot_vm(struct vm *vm)
 {
 }
 
+int tcp_listen_on(int port, int max_listen) {
+    int sockfd, itrue;
+    struct sockaddr_in servaddr;
+    
+    sockfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if(sockfd == -1)
+	fatal("Unable to get a socket");
+    itrue = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &itrue, sizeof(int));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
+    if(bind(sockfd, (struct sockaddr *)&servaddr,
+            sizeof(servaddr)) != 0) {
+	fatal("Unable to bind the socket on %d\n", port);
+    }
+    if(listen(sockfd, max_listen) != 0) {
+        fatal("listen failed max_liste = %d\n", max_listen);
+    }
+
+    return sockfd;
+}
+
 int setup_usercode_mmap(struct vm *vm)
 {
     int i;
     uint32_t inp_off, out_off;
-    /*
-    struct exec_path_name u_exec[] = {
-	{.path = "/home/prakhar/data/code/shared_user_code/",
-	 .name = "shared_user_code"
-	},
-	{.path = "/home/prakhar/data/code/nfvs/firewall/",
-	 .name = "main"
-	},
-	{.path = "/home/prakhar/data/code/nfvs/ids/",
-	 .name = "main"
-	},
-	{.path = "/home/prakhar/data/code/nfvs/encrypt/",
-	 .name = "main"
-	},
-	{.path = "",
-	 .name = ""
-	}
-    };
-    */
+    int sockfd, clifd, len;
+    char buf[128], *tcpbuf;
+    int n, tot;
+    struct sockaddr_in servaddr, cli;
+    pid_t c_pid;
+    struct rt_exec_path_name *u_exec = app.exec;
     
-    struct exec_path_name u_exec[] = {
-	{.path = "/home/prakhar/data/code/shared_user_code/",
-	 .name = "shared_user_code",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,
-	},
-	{.path = "/home/prakhar/data/code/amd_math_test/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},
-	{.path = "/home/prakhar/data/code/null_fn/",
-	 .name = "main",
-	 .inp_off = 0x1000,
-	 .out_off = 0x2000,	 
-	},	
-	{.path = "",
-	 .name = "",
-	 .inp_off = 0,
-	 .out_off = 0, 
-	}
-    };
+    sockfd = tcp_listen_on(SERVER_PORT, MAX_LISTEN);
+read_again:
+    clifd = accept(sockfd, (struct sockaddr *)&cli, &len);
+    tcpbuf = (typeof(tcpbuf))&app;
+    // big packet, read till you get everything!
+    tot = 0;
+    while((n = read(clifd, &tcpbuf[tot], sizeof(app) - tot)) >= 0) {
+	tot += n;
+	if(tot >= sizeof(app))
+	    break;
+    }
+    ts(t1);
+    if((c_pid = fork()) != 0) {
+	close(clifd);
+	goto read_again;
+    }
+    else {
+	vm->pid = getpid();
+	//printf("pid = %d\n", vm.pid);
+    }
+    vm->metadata->num_nodes = app.num_nodes;
+
+    memcpy(vm->metadata->dag, app.dag, sizeof(app.dag));
+    memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
+    vm->metadata->start_func = 0;
     
-    assert(sizeof(u_exec) < sizeof(vm->exec_deps));
     vm->shared_mem =						\
 	(uint8_t *)mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, \
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -979,7 +944,7 @@ int setup_usercode_mmap(struct vm *vm)
     
     vm->num_exec = 0;
     for(i = 0; i < ARR_SZ_1D(vm->exec_deps); i++) {
-	if(u_exec[i].name[0] == '\0')
+	if(u_exec[i].name[0] == '\0' || i > app.num_nodes)
 	    break;
 	// TBD where to call fin
 	ATARU_LD_FUNC_PATH = u_exec[i].path;
@@ -1120,59 +1085,6 @@ void register_umem_mmap(struct vm *vm)
 	}
 	gp_pt += 512;
     }
-    /*
-      dag repr:
-      num_nodes
-      in_vertex_count_per_node
-      start_of_out_vertex_idxes
-
-          1
-        /   \
-       0     3
-        \   /
-          2
-
-      output repr:
-      4  // num_nodes
-      0  // 0 in count dag[] starts here
-      1  // 1 in count
-      1  // 2 in count
-      2  // 3 in count
-      0  // 0 start_idx
-      2  // 1 start_idx
-      3  // 2 start_idx
-      4  // 3 start_idx  (no out edge so same idxes)
-      4  // 3 end_idx
-      1  // out_edge 0
-      2
-      3  // out_edge 1
-      3  // out_edge 2
-     */
-
-    /*
-          1
-        /   \
-       0     3
-        \   /
-          2
-    */
-    vm->metadata->num_nodes = 11;
-    {
-
-	/*
-	uint16_t tmp_arr[] = {
-	    0,1,1,0,1,2,2,1,2,
-	};
-	*/
-	
-	uint16_t tmp_arr[] = {
-	    0,1,1,1,2,3,1,2,1,1,3,0,3,4,6,8,9,10,13,14,15,16,16,1,2,3,4,4,5,5,6,7,7,5,8,9,10,10,10,
-	};
-	
-	memcpy(vm->metadata->dag, tmp_arr, sizeof(tmp_arr));
-    }
-    memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
-    vm->metadata->start_func = 0;
 }
 
 // resolve rel with sym in mm, whereas sym belongs to lib
@@ -1647,3 +1559,59 @@ void dump_self_smaps()
     fclose(fpw);
     
 }
+
+int connect_to(int sockfd, char ip[], int port)
+{
+    struct sockaddr_in servaddr;
+    int itrue, ret = 0;
+    itrue = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
+               &itrue, sizeof(int));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = inet_addr(ip);
+    servaddr.sin_port = htons(port);
+    if (connect(sockfd, (struct sockaddr *)&servaddr,
+                sizeof(servaddr)) != 0) {
+	fatal("connfd failed\n");
+	ret = -1;
+    }
+
+    return ret;
+}
+
+/*
+  dag repr:
+  num_nodes
+      in_vertex_count_per_node
+      start_of_out_vertex_idxes
+
+          1
+        /   \
+       0     3
+        \   /
+          2
+
+      output repr:
+      4  // num_nodes
+      0  // 0 in count dag[] starts here
+      1  // 1 in count
+      1  // 2 in count
+      2  // 3 in count
+      0  // 0 start_idx
+      2  // 1 start_idx
+      3  // 2 start_idx
+      4  // 3 start_idx  (no out edge so same idxes)
+      4  // 3 end_idx
+      1  // out_edge 0
+      2
+      3  // out_edge 1
+      3  // out_edge 2
+*/
+
+/*
+          1
+        /   \
+       0     3
+        \   /
+          2
+*/
