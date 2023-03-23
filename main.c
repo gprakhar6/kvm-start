@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <fcntl.h>
 #include <time.h>
 #include <sched.h>
@@ -35,10 +36,10 @@
 
 #define __IRQCHIP__
 
-#define fatal(s, ...) do {				\
+#define fatal(s, ...) do {						\
 	printf("%s.%04d: %s :",__FILE__,__LINE__, strerror(errno));	\
-	printf(s, ##__VA_ARGS__);			\
-	exit(1);					\
+	printf(s, ##__VA_ARGS__);					\
+	exit(1);							\
     } while(0)
 
 #define ONE_PAGE (0x1000)
@@ -54,10 +55,36 @@
 #define ARR_SZ_1D(x) (sizeof(x)/sizeof(x[0]))
 #define ts(x) (gettimeofday(&x, NULL))
 #define dt(t2, t1) ((t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec))
-#define dtsc(y,x) ((y-x)%())
-#define pdt() printf("dt = %ld us\n", dt(t2,t1));
-#define pts(ts) printf("ts = %ld us\n", (ts.tv_sec*1000000 + ts.tv_usec));
-#define tr_result(s, b, ...) do {write(s, b, sprintf(b, ##__VA_ARGS__));} while(0);
+#define pdt() printf("dt = %ld us\n", dt(t2,t1))
+#define pts(ts) {printf("ts = %ld us\n", (ts.tv_sec*1000000 + ts.tv_usec))}
+#define tr_result(s, b, ...) do {write(s, b, sprintf(b, ##__VA_ARGS__));} while(0)
+#define vcpumeta(v) ((*(vcpu->metadata))->v)
+#define declobj(type, var_name) type var_name = type ## _ ## constructor()
+#define	update_stat(o, v) (o)->update_stat(o, v)
+    
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
+enum {
+    eboot_time = 0,
+    edag_tot_t,
+    enet_time,
+    efunc0,
+    efunc_maxfunc = efunc0 + MAX_FUNC,
+    etot_stat
+};
+
+typedef struct t_pstat {
+    double cur;
+    uint64_t n;
+    double max;
+    double min;
+    double avg;
+    double Ex2;
+    double std;
+    void (*update_stat)(struct t_pstat *stat, double cur);
+} t_pstat;
+    
 struct t_page_table {
     uint64_t e[512];
 };
@@ -93,8 +120,8 @@ enum elf_type {
 };
 
 struct exec_path_name {
-    char path[MAX_NAME_LEN + 1];
-    char name[MAX_NAME_LEN + 1];
+    char path[128];
+    char name[64];
     uint64_t inp_off;
     uint64_t out_off;
 };
@@ -146,6 +173,7 @@ static uint64_t tsc_t1, tsc_t2;
 static double tsc2ts;
 static sem_t vcpu_init_barrier, sem_vcpu_init[MAX_VCPUS];
 static sem_t sem_booted, sem_usercode_loaded, sem_work_wait, sem_work_fin;
+static uint64_t boot_time;
 // currently each function resides on one folder
 // with library maybe softlinked in that folder
 char *ATARU_LD_FUNC_PATH;
@@ -153,13 +181,14 @@ int isol_core_start = 12;
 int runtime_vcpus = 1, runtime_pcpus = 1;
 static char str_sys_cmd[1024];
 static char result_buf[1024];
-
+static char file_buf[sizeof(result_buf)-1];
+static t_pstat pstats[etot_stat];
 static uint64_t gp2hv[NR_GP2HV];
 #define GP2HV(x)  (gp2hv[((x) >> 21)] + ((x) & (MB_2 - 1)))
 static struct app_defn_t app;
 
-static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}'";
-static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}'";
+static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}' > tmp/private.txt";
+static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}' > tmp/pss.txt";
 
 
 static inline int handle_io_port(t_vcpu *vcpu);
@@ -183,6 +212,12 @@ void print_hex(uint8_t *a, int sz);
 void dump_self_smaps();
 uint64_t guest2host(uint64_t cr3, uint64_t addr);
 int connect_to(int sock, char ip[], int port);
+int read_file(char b[], int bs, const char fname[]);
+
+
+// struct t_pstat member functions
+struct t_pstat t_pstat_constructor();
+void t_pstat_update_stat(t_pstat *stat, double cur);
 
 static inline uint64_t tsc()
 {
@@ -226,8 +261,8 @@ int main(int argc, char *argv[])
     setup_bootcode_mmap(&vm); // 750 us
     setup_usercode_mmap(&vm); // 290 us
     resolve_dynsyms(&vm);
-    printf("(after funcs mmap)\nprivate_clean + private_dirty + private_hugetlb(kB):\n");
-    fflush(stdout);
+    //printf("(after funcs mmap)\nprivate_clean + private_dirty + private_hugetlb(kB):\n");
+    //fflush(stdout);
     dump_self_smaps();
     sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
     system(str_sys_cmd);
@@ -257,9 +292,11 @@ int main(int argc, char *argv[])
 int decode_msg(t_vcpu *vcpu, uint16_t msg)
 {
     int i;
-    int ret = 0, len;
+    int ret = 0, len, fn;
     int buflen;
-    static double net_time = 0.0;
+    static double net_time = 0.0, cold_dag_tsc_time;
+    static uint64_t cold_req_time;
+    
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
 	for(i = 1; i < vcpu->pool_size; i++)
@@ -278,14 +315,14 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//pts(t2);
 	if(pktcnt == 0) {
 	    ts(t2);
-	    printf("Boot time = %lu us\n", dt(t2,t1));
+	    boot_time = dt(t2,t1);
 	    //exit(-1);
-	    printf("private_clean + private_dirty + private_hugetlb(kB):\n");
+	    //printf("private_clean + private_dirty + private_hugetlb(kB):\n");
 	    fflush(stdout);
 	    dump_self_smaps();
 	    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
 	    system(str_sys_cmd);
-	    printf("pss(kB):\n");
+	    //printf("pss(kB):\n");
 	    fflush(stdout);
 	    sprintf(str_sys_cmd, sprintf_cmd_pss, smap_file_name);
 	    system(str_sys_cmd);
@@ -293,17 +330,127 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    //printf("ts(t1)\n");
 	    ts(t1);
 	}
-	//printf("shm = %d\n", *(int *)*(vcpu->shared_mem));
-	*(int *)*(vcpu->shared_mem) = 1;
-	buflen = MB_1;
+	// cold start times
+	if(pktcnt == 1) {
+	    ts(t2);
+	    cold_dag_tsc_time = (double)vcpumeta(dag_tot_tsc_time);
+	    cold_req_time = dt(t2,t1);
+	}
+	if(pktcnt > 1) {
+	    for(i = efunc0; i < efunc_maxfunc; i++) {
+		fn = i - (int)efunc0;
+		update_stat(&pstats[i],					\
+			    (double)vcpumeta(dag_func_time[fn]));
+	    }
+	    update_stat(&pstats[edag_tot_t],
+			(double)vcpumeta(dag_tot_tsc_time));
+	    update_stat(&pstats[enet_time], (double)net_time);
+	    /*
+	    if(((pktcnt-1) % 1000 == 0) ||
+	       ((pktcnt-2) % 1000 == 0) ||
+		((pktcnt-3) % 1000 == 0)) {
+		printf("min = %lf\n", pstats[eboot_time].min);
+		printf("max = %lf\n", pstats[eboot_time].max);
+		printf("avg = %lf\n", pstats[eboot_time].avg);
+	    }
+	    */
+	}
+	//printf("%d: %d\n",buflen,pktcnt);
+	if(pktcnt >= app.pktcnt) {
+	    int result_sock, wait_s;
+	    ts(t2);
+	    tsc_t2 = tsc();
+	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);
+	    if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+		fatal("unable to open result socket\n");
+	    if(app.result_port <= 0)
+		goto skip_tr;
+	    printf("Connecting to %s ip, at port %d\n", app.result_ip,
+		   app.result_port);
+	    wait_s = 2;
+	    while(connect_to(result_sock,
+			     app.result_ip,
+			     app.result_port)) {
+		sleep(1);
+		wait_s--;
+		if(wait_s < 0)
+		    fatal("timeout for connecting to result socket\n");
+	    }
+#define TR(...)	tr_result(result_sock, result_buf, ##__VA_ARGS__)
+	    // boot time is us
+	    TR("%-10ld ", boot_time);
+	    TR("%-10ld ", dt(t2, t1));
+	    //printf("tsc2ts = %lf, tsc_t1 = %lu, ts_t2 = %lu, sub=%lu\n", tsc2ts, tsc_t1, tsc_t2, tsc_t2 - tsc_t1);
+	    // tsc difference
+	    TR("%-16lu ", tsc_t2 - tsc_t1);
+	    TR("%-10d ", app.pktcnt);
+	    TR("%-10d ", buflen);
+	    // private_mem
+	    read_file(file_buf, sizeof(file_buf), "tmp/private.txt");
+	    TR("%-12s ", file_buf);
+	    // pss
+	    read_file(file_buf, sizeof(file_buf), "tmp/pss.txt");
+	    TR("%-12s ", file_buf);
+	    //printf("avg dag_ts = %lf us, %ld\n", (*(vcpu->metadata))->dag_ts * tsc2ts, (*(vcpu->metadata))->dag_n);
+	    /*
+	      printf("avg dag_ts = %lf us\n",
+	      ((*(vcpu->metadata))->dag_ts /
+	      (*(vcpu->metadata))->dag_n) * tsc2ts);
+	    */
+	    /*
+	    TR("%-16.5lf ",
+	       ((*(vcpu->metadata))->dag_tot_tsc_time /
+		(*(vcpu->metadata))->dag_tot_proc_inp) * tsc2ts);
+	    */
+	    TR("%-10d ", vcpumeta(num_nodes));
+	    TR("%-15lu ", cold_req_time);
+	    TR("%-15lf ", cold_dag_tsc_time * tsc2ts);
+	    TR("%-15lf %-15lf %-15lf %-15lf %-15lf ",
+	       pstats[edag_tot_t].min * tsc2ts,
+	       pstats[edag_tot_t].avg * tsc2ts,
+	       pstats[edag_tot_t].max * tsc2ts,
+	       pstats[edag_tot_t].std * tsc2ts,
+	       pstats[edag_tot_t].avg * pstats[edag_tot_t].n * tsc2ts);
+
+	    TR("%-16lf ",
+	       ((*(vcpu->metadata))->dag_ts) * tsc2ts);
+
+	    TR("%-8lf ",
+	       ((*(vcpu->metadata))->dag_ts /
+		(*(vcpu->metadata))->dag_n) * tsc2ts);
+	    TR("%-15lf ", net_time);
+	    for(i = 0; i < app.num_nodes; i++) {
+		TR("%-15lf %-15lf %-15lf %-15lf %-15lf ",
+		   pstats[efunc0+i].min * tsc2ts,
+		   pstats[efunc0+i].avg * tsc2ts,
+		   pstats[efunc0+i].max * tsc2ts,
+		   pstats[efunc0+i].std * tsc2ts,
+		   pstats[efunc0+i].avg * pstats[efunc0+i].n * tsc2ts);
+		/*
+		TR("%-15lf ", ((double)vcpumeta(dag_func_time[i]) /
+			       vcpumeta(dag_tot_proc_inp)) * tsc2ts);
+		*/
+	    }
+	    //printf("net_time = %lf\n", net_time);
+	    printf("num dag invocations = %lu\n", (*(vcpu->metadata))->dag_tot_proc_inp);
+	    TR("\n");
+	skip_tr:	    
+	    close(result_sock);
+#undef TR	    
+	    exit(-1);
+	}
+	
+	buflen = MB_1 - sizeof(struct t_shm); 
 	{
 	    struct iovec iovec[2];
 	    struct msghdr msg;
 	    uint64_t addr = (uint64_t)*(vcpu->shared_mem);
 	    ((struct t_shm *)addr)->next = NULL;
+	    
 	    iovec[0].iov_base = \
 		(typeof(iovec[0].iov_base))(addr + \
 					    sizeof(struct t_shm));
+	    
 	    iovec[0].iov_len = buflen;
 	    msg.msg_name = vcpu->saddr_f;
 	    msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
@@ -315,85 +462,19 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 
 	    ts(t1_net);
 	    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
+	    if(buflen <= 0)
+		fatal("recvmsg returns error\n");
+	    //print_hex(addr, 64);
+	    //printf("buflen = %d\n", buflen);
 	    ts(t2_net);
 	    net_time += dt(t2_net, t1_net);
-	    //printf("buflen = %d\n", buflen);
-	    /*
-	    printf("shm: ");
-	    {
-		int h;
-		for(h = 0; h < 64; h++) {
-		    printf("%02X(%d,%c) ",((unsigned char *)(iovec[0].iov_base))[h],h,((char *)(iovec[0].iov_base))[h]);
-		    if((h-1) % 4 == 0)
-			printf("\n");
-		}
-	    }
-	    printf("\n");
-	    */
 	    
 	}
 	if(buflen <= 0)
 	    printf("bad buflen %d\n", buflen);
-	/*
-	if((buflen = recvfrom(*(vcpu->sock_f), *(vcpu->shared_mem), buflen,
-			      0, vcpu->saddr_f, (socklen_t *)vcpu->sockaddr_f_len)) <= 0)
-	    fatal("bad buflen\n");
-	*/
-	//sem_post(&sem_work_fin);
-	//sem_wait(&sem_work_wait);
-	//exit(-1);
-	//printf("Waiting for work\n");
-	
-	pktcnt++;
-	//printf("%d: %d\n",buflen,pktcnt);
-	if(pktcnt >= 10000) {
-	    int result_sock, wait_s;
-	    ts(t2);
-	    tsc_t2 = tsc();
-	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);	    
-	    if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-		fatal("unable to open result socket\n");
-	    printf("Connecting to %s ip, at port %d\n", app.result_ip,
-		app.result_port);
-	    wait_s = 2;
-	    while(connect_to(result_sock,
-			     app.result_ip,
-			     app.result_port)) {
-		sleep(1);
-		wait_s--;
-		if(wait_s < 0)
-		    fatal("timeout for connecting to result socket\n");
-	    }
-#define TR(...)	tr_result(result_sock, result_buf, ##__VA_ARGS__)
-	    TR("%-8ld ", dt(t2, t1));
-	    //printf("tsc2ts = %lf, tsc_t1 = %lu, ts_t2 = %lu, sub=%lu\n", tsc2ts, tsc_t1, tsc_t2, tsc_t2 - tsc_t1);
-	    TR("%-8lu ", tsc_t2 - tsc_t1);
-	    //printf("avg dag_ts = %lf us, %ld\n", (*(vcpu->metadata))->dag_ts * tsc2ts, (*(vcpu->metadata))->dag_n);
-	    /*
-	    printf("avg dag_ts = %lf us\n",
-		   ((*(vcpu->metadata))->dag_ts /
-		    (*(vcpu->metadata))->dag_n) * tsc2ts);
-	    */
-	    TR("%-8lf ",
-		   ((*(vcpu->metadata))->dag_ts /
-		    (*(vcpu->metadata))->dag_n) * tsc2ts);
-	    for(i = 0; i < app.num_nodes; i++) {
-		//struct t_shm *shm = (struct t_shm *)(*(vcpu->shared_mem));
-		//printf("fndt[%d] = %lf\n", i, ((double)shm->fndt[i]) * tsc2ts);
-		TR("%-15lf ", ((double)(*(vcpu->metadata))->dag_func_time[i]) * tsc2ts);
-	    }
-	    //printf("net_time = %lf\n", net_time);
-	    TR("%-8lf ", net_time);
 
-	    TR("\n");
-	    close(result_sock);
-#undef TR	    
-	    exit(-1);
-	}
-	/*
-	if(pktcnt % 1000 == 0)
-	    printf("%d:smem = %08X,cnt=%d\n", vcpu->id, **(uint32_t **)vcpu->shared_mem, pktcnt);
-	*/
+	pktcnt++;
+	
 	break;
     default:
 	fatal("Unknown msg from the guest");
@@ -545,24 +626,25 @@ static inline int handle_io_port(t_vcpu *vcpu)
 }
 
 static struct sock_filter code[] = {
-{ 0x28, 0, 0, 0x0000000c },
-{ 0x15, 0, 4, 0x00000800 },
-{ 0x20, 0, 0, 0x0000001a },
-{ 0x15, 8, 0, 0x0a1046f0 },
-{ 0x20, 0, 0, 0x0000001e },
-{ 0x15, 6, 7, 0x0a1046f0 },
-{ 0x15, 1, 0, 0x00000806 },
-{ 0x15, 0, 5, 0x00008035 },
-{ 0x20, 0, 0, 0x0000001c },
-{ 0x15, 2, 0, 0x0a1046f0 },
-{ 0x20, 0, 0, 0x00000026 },
-{ 0x15, 0, 1, 0x0a1046f0 },
-{ 0x6, 0, 0, 0x00040000 },
-{ 0x6, 0, 0, 0x00000000 },
+    { 0x28, 0, 0, 0x0000000c },
+    { 0x15, 0, 4, 0x00000800 },
+    { 0x20, 0, 0, 0x0000001a },
+    { 0x15, 8, 0, 0x0a1046f0 },
+    { 0x20, 0, 0, 0x0000001e },
+    { 0x15, 6, 7, 0x0a1046f0 },
+    { 0x15, 1, 0, 0x00000806 },
+    { 0x15, 0, 5, 0x00008035 },
+    { 0x20, 0, 0, 0x0000001c },
+    { 0x15, 2, 0, 0x0a1046f0 },
+    { 0x20, 0, 0, 0x00000026 },
+    { 0x15, 0, 1, 0x0a1046f0 },
+    { 0x6, 0, 0, 0x00040000 },
+    { 0x6, 0, 0, 0x00000000 },
 };
 
 int get_vm(struct vm *vm)
 {
+    int i;
     int kvm, ret;
     int err, nent;
     
@@ -624,6 +706,8 @@ int get_vm(struct vm *vm)
     vm->metadata->bit_map_inactive_cpus = ~0;
     vm->metadata->num_active_cpus = 0;
     vm->slot_no = 0;
+    for(i = 0; i < ARR_SZ_1D(pstats); i++)
+	pstats[i] = t_pstat_constructor();
     return err;
 }
 
@@ -643,9 +727,9 @@ void *create_vcpu(void *vvcpu)
     // depend on linux sched for affinity within pcpus
     core_id = isol_core_start;
     for(i = 0; i < runtime_pcpus; i++) {
-	CPU_SET(core_id, &cpuset);
-	//printf("core_id = %d\n", core_id);
-	core_id += 1;
+    CPU_SET(core_id, &cpuset);
+    //printf("core_id = %d\n", core_id);
+    core_id += 1;
     }
     */
     
@@ -952,7 +1036,7 @@ read_again:
 	inp_off = u_exec[i].inp_off;
 	out_off = u_exec[i].out_off;
 	if(inp_off >= SHM_SIZE
-	    || out_off >= SHM_SIZE)
+	   || out_off >= SHM_SIZE)
 	    fatal("The inp(%d) or out(%d) offsets are beyond %d",
 		  inp_off, out_off, SHM_SIZE);
 	vm->exec_deps[i].exec[0].func_prop.inp_off = inp_off;
@@ -994,7 +1078,7 @@ void register_mem(struct vm *vm, void *hva, uint64_t *gpa,
 }
 
 void cont_map_p2(uint64_t *pt, uint64_t start_addr, int num_entries,
-    uint64_t pg_flags)
+		 uint64_t pg_flags)
 {
     int i;
     for(i = 0; i < num_entries; i++) {
@@ -1121,8 +1205,8 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
     
     //printf("%s, mm_p3e = %d,dep_lib_start = %016lX\n", rel->name, mm_p3e, dep_lib_start);
     /*
-    printf("0:offset = %016lX\nvalue = %016lX\ne_start=%016lX\n",
-	   offset, sym->st_value, e_start);
+      printf("0:offset = %016lX\nvalue = %016lX\ne_start=%016lX\n",
+      offset, sym->st_value, e_start);
     */
     offset = rel->offset - e_start;
     value = sym->st_value - sym_e_start;
@@ -1142,7 +1226,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 	ELF64_ST_BIND(sym->st_info) == STB_WEAK ||
 	ELF64_ST_BIND(sym->st_info) == 0) &&
        (ELF64_ST_VISIBILITY(sym->st_other) == STV_DEFAULT ||
-	   ELF64_ST_VISIBILITY(sym->st_other) == 0)) {
+	ELF64_ST_VISIBILITY(sym->st_other) == 0)) {
 	switch(ELF64_ST_TYPE(sym->st_info)) {
 	case STT_FUNC:
 	    switch(rel->type) {
@@ -1391,28 +1475,28 @@ void* sock_loop(void *vvm)
     struct sockaddr saddr;
     char *buffer;
     /*
-    sock = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
-    if(sock < 0)
-	fatal("cannot create sock for the flow\n");
-    sockaddr_len = sizeof(saddr);
-    printf("sock listening on br0\n");
-    buffer = vm->shared_mem;
+      sock = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
+      if(sock < 0)
+      fatal("cannot create sock for the flow\n");
+      sockaddr_len = sizeof(saddr);
+      printf("sock listening on br0\n");
+      buffer = vm->shared_mem;
     */
     /*
-    buffer = mmap(NULL, MB_2, PROT_READ | PROT_WRITE,
-		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      buffer = mmap(NULL, MB_2, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     */
     /*
-    while(1) { 
-	buflen = recvfrom(sock, buffer, MB_2, 0, &saddr,
-			  (socklen_t *)&sockaddr_len);
-	if(buflen <= 0)
-	    fatal("buflen <= 0");
-	//printf("buflen = %d, buf = %d\n", buflen, *(int *)buffer);
-	sem_post(&sem_work_wait);
-	sem_wait(&sem_work_fin);
-	//sendto(sock, buffer, buflen, 0, &saddr, (socklen_t)sockaddr_len);
-    }
+      while(1) { 
+      buflen = recvfrom(sock, buffer, MB_2, 0, &saddr,
+      (socklen_t *)&sockaddr_len);
+      if(buflen <= 0)
+      fatal("buflen <= 0");
+      //printf("buflen = %d, buf = %d\n", buflen, *(int *)buffer);
+      sem_post(&sem_work_wait);
+      sem_wait(&sem_work_fin);
+      //sendto(sock, buffer, buflen, 0, &saddr, (socklen_t)sockaddr_len);
+      }
     */
     return NULL;
 }
@@ -1530,7 +1614,7 @@ void print_hex(uint8_t *a, int sz)
     int i;
     for(i = 0; i < sz; i++) {
 	if(i % 8 == 0)
-	    printf("%04X: ", 0);
+	    printf("%04X: ", i);
 	printf("%02X ", a[i]);
 	if((i+1)%8 == 0)
 	    printf("\n");
@@ -1579,39 +1663,85 @@ int connect_to(int sockfd, char ip[], int port)
     return ret;
 }
 
+int read_file(char b[], int bs, const char fname[]) {
+    int i, rd, n;
+    FILE *fp;
+    if((fp = fopen(fname, "r")) == NULL)
+	fatal("cannot open %s\n", fname);
+
+    i = n = 0;
+    do {
+	rd = bs - i;
+	i += n;
+    }
+    while((rd > 0) && ((n = fread(&b[i], 1, rd, fp)) > 0));
+    if(b[i-1] == '\n')
+	b[i-1] = '\0';
+    fclose(fp);
+    return i;
+}
+
+t_pstat t_pstat_constructor()
+{
+    t_pstat s;
+    s.cur = 0;
+    s.n = 0;
+    s.max = 0;
+    s.min = INFINITY;
+    s.avg = 0;
+    s.Ex2 = 0;
+    s.std = 0;
+    s.update_stat = t_pstat_update_stat;
+
+    return s;
+}
+void t_pstat_update_stat(t_pstat *stat, double cur)
+{
+    double cur2;
+    double np1;
+    cur2 = cur*cur;
+    np1 = stat->n + 1;
+    stat->cur = cur;
+    stat->max = max(stat->max, stat->cur);
+    stat->min = min(stat->min, stat->cur);
+    stat->avg = ((stat->avg * stat->n) + stat->cur) / (np1);
+    stat->Ex2 = ((stat->Ex2 * stat->n) + cur2) / (np1);
+    stat->std = sqrt(stat->Ex2 - (stat->avg)*(stat->avg));
+    stat->n = np1;
+}
 /*
   dag repr:
   num_nodes
-      in_vertex_count_per_node
-      start_of_out_vertex_idxes
+  in_vertex_count_per_node
+  start_of_out_vertex_idxes
 
-          1
-        /   \
-       0     3
-        \   /
-          2
+  1
+  /   \
+  0     3
+  \   /
+  2
 
-      output repr:
-      4  // num_nodes
-      0  // 0 in count dag[] starts here
-      1  // 1 in count
-      1  // 2 in count
-      2  // 3 in count
-      0  // 0 start_idx
-      2  // 1 start_idx
-      3  // 2 start_idx
-      4  // 3 start_idx  (no out edge so same idxes)
-      4  // 3 end_idx
-      1  // out_edge 0
-      2
-      3  // out_edge 1
-      3  // out_edge 2
+  output repr:
+  4  // num_nodes
+  0  // 0 in count dag[] starts here
+  1  // 1 in count
+  1  // 2 in count
+  2  // 3 in count
+  0  // 0 start_idx
+  2  // 1 start_idx
+  3  // 2 start_idx
+  4  // 3 start_idx  (no out edge so same idxes)
+  4  // 3 end_idx
+  1  // out_edge 0
+  2
+  3  // out_edge 1
+  3  // out_edge 2
 */
 
 /*
-          1
-        /   \
-       0     3
-        \   /
-          2
+  1
+  /   \
+  0     3
+  \   /
+  2
 */

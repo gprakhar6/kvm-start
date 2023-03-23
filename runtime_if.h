@@ -32,8 +32,10 @@ struct t_metadata {
     uint8_t current[64];
     t_sched_status sched_status;
     uint64_t dag_ts, dag_n;
+    uint64_t dag_tot_tsc_time, dag_tot_proc_inp;
     uint8_t num_nodes;
     uint8_t start_func;
+    uint16_t spare;
     uint16_t dag[MAX_DAG_ARR_SZ];
     uint16_t dag_in_count[MAX_FUNC]; // used by runtime
     uint32_t dag_func_time[MAX_FUNC];
