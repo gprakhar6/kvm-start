@@ -14,6 +14,7 @@
 #define MAX_VCPUS                        (64) // because uint64_t
 #define MAX_DEPS                         (16)
 #define SERVER_PORT                      (9988)
+#define APP_FIN_PORT                     (9989)
 #define MAX_LISTEN                       (4)
 #define MAX_NAME_LEN                     (1023)
 #define STR_MAPPED                       ("_mapped")

@@ -73,15 +73,22 @@ enum {
     efunc_maxfunc = efunc0 + MAX_FUNC,
     etot_stat
 };
-
+typedef enum {
+    eraw,
+    etcp
+} conn_t;
 typedef struct t_pstat {
     double cur;
     uint64_t n;
     double max;
     double min;
-    double avg;
+    double Ex1;
     double Ex2;
+    double Ex3;
+    double Ex4;
     double std;
+    double skw;
+    double kurt;
     void (*update_stat)(struct t_pstat *stat, double cur);
 } t_pstat;
     
@@ -179,17 +186,39 @@ static uint64_t boot_time;
 char *ATARU_LD_FUNC_PATH;
 int isol_core_start = 12;
 int runtime_vcpus = 1, runtime_pcpus = 1;
+int out_off_print = 0, num_out_print = 0;
 static char str_sys_cmd[1024];
 static char result_buf[1024];
 static char file_buf[sizeof(result_buf)-1];
 static t_pstat pstats[etot_stat];
 static uint64_t gp2hv[NR_GP2HV];
+static conn_t conn_type;
+static int result_sock, wait_s, tcp_server_sock;
 #define GP2HV(x)  (gp2hv[((x) >> 21)] + ((x) & (MB_2 - 1)))
 static struct app_defn_t app;
 
 static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}' > tmp/private.txt";
 static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}' > tmp/pss.txt";
+static struct sock_filter code[] = {
+    { 0x28, 0, 0, 0x0000000c },
+    { 0x15, 0, 4, 0x00000800 },
+    { 0x20, 0, 0, 0x0000001a },
+    { 0x15, 8, 0, 0x0a1046f0 },
+    { 0x20, 0, 0, 0x0000001e },
+    { 0x15, 6, 7, 0x0a1046f0 },
+    { 0x15, 1, 0, 0x00000806 },
+    { 0x15, 0, 5, 0x00008035 },
+    { 0x20, 0, 0, 0x0000001c },
+    { 0x15, 2, 0, 0x0a1046f0 },
+    { 0x20, 0, 0, 0x00000026 },
+    { 0x15, 0, 1, 0x0a1046f0 },
+    { 0x6, 0, 0, 0x00040000 },
+    { 0x6, 0, 0, 0x00000000 },
+};
 
+int tcp_listen_on(int port, int max_listen);
+int getinp_raw(t_vcpu *vcpu);
+int getinp_tcp(t_vcpu *vcpu, int len);
 
 static inline int handle_io_port(t_vcpu *vcpu);
 int get_vm(struct vm *vm);
@@ -254,6 +283,26 @@ int main(int argc, char *argv[])
 	    printf("%s num = %d\n", argv[i], runtime_pcpus);
 	    i+=2;
 	    continue;
+	}
+	if(strcmp(argv[i], "parg") == 0) {
+	    if(i+2 >= argc)
+		fatal("provide option for %s\n", argv[i]);
+	    
+	    if(sscanf(argv[i+1], "%d", &out_off_print) != 1) {
+		printf("provide numeric argument to %s\n", argv[i]);
+		exit(-1);
+	    }
+	    if(sscanf(argv[i+2], "%d", &num_out_print) != 1) {
+		printf("provide numeric argument to %s\n", argv[i]);
+		exit(-1);
+	    }
+	    if(out_off_print > SHM_SIZE || num_out_print > 128) {
+		fatal("bad:out_off_print=%d,num_out_print=%d",
+		      out_off_print, num_out_print);
+	    }
+	    printf("%s,offset=%d,num2print=%d\n", argv[i],out_off_print, num_out_print);
+	    i+=3;
+	    continue;
 	}	
     }
     
@@ -296,7 +345,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
     int buflen;
     static double net_time = 0.0, cold_dag_tsc_time;
     static uint64_t cold_req_time;
-    
+    struct sockaddr_in cli;
     switch(msg) {
     case 1: // init sent to all guest vcpu by vcpu 0
 	for(i = 1; i < vcpu->pool_size; i++)
@@ -326,6 +375,21 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    fflush(stdout);
 	    sprintf(str_sys_cmd, sprintf_cmd_pss, smap_file_name);
 	    system(str_sys_cmd);
+	    if(conn_type == eraw) {
+		*(vcpu->sock_f) = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
+		printf("sock listening on br0\n");    
+	    }
+	    else if (conn_type = etcp) {
+		printf("accepting the connection\n");
+		*(vcpu->sock_f) = accept(tcp_server_sock, (struct sockaddr *)&cli, &len);
+		printf("Rxed connection\n");
+		close(tcp_server_sock);
+	    }
+	    else
+		fatal("Unknown conn_type");
+	    if(*(vcpu->sock_f) <= 0)
+		fatal("cannot create sock for the flow\n");
+	    *(vcpu->sockaddr_f_len) = sizeof(*(vcpu->saddr_f));	    
 	    tsc_t1 = tsc();
 	    //printf("ts(t1)\n");
 	    ts(t1);
@@ -351,31 +415,16 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 		((pktcnt-3) % 1000 == 0)) {
 		printf("min = %lf\n", pstats[eboot_time].min);
 		printf("max = %lf\n", pstats[eboot_time].max);
-		printf("avg = %lf\n", pstats[eboot_time].avg);
+		printf("avg = %lf\n", pstats[eboot_time].Ex1);
 	    }
 	    */
 	}
 	//printf("%d: %d\n",buflen,pktcnt);
 	if(pktcnt >= app.pktcnt) {
-	    int result_sock, wait_s;
 	    ts(t2);
 	    tsc_t2 = tsc();
+	    printf("Sched_getcpu = %d\n", sched_getcpu());
 	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);
-	    if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-		fatal("unable to open result socket\n");
-	    if(app.result_port <= 0)
-		goto skip_tr;
-	    printf("Connecting to %s ip, at port %d\n", app.result_ip,
-		   app.result_port);
-	    wait_s = 2;
-	    while(connect_to(result_sock,
-			     app.result_ip,
-			     app.result_port)) {
-		sleep(1);
-		wait_s--;
-		if(wait_s < 0)
-		    fatal("timeout for connecting to result socket\n");
-	    }
 #define TR(...)	tr_result(result_sock, result_buf, ##__VA_ARGS__)
 	    // boot time is us
 	    TR("%-10ld ", boot_time);
@@ -405,12 +454,14 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    TR("%-10d ", vcpumeta(num_nodes));
 	    TR("%-15lu ", cold_req_time);
 	    TR("%-15lf ", cold_dag_tsc_time * tsc2ts);
-	    TR("%-15lf %-15lf %-15lf %-15lf %-15lf ",
+	    TR("%-15lf %-15lf %-15lf %-15lf %-15lf %-15lf %-15lf ",
 	       pstats[edag_tot_t].min * tsc2ts,
-	       pstats[edag_tot_t].avg * tsc2ts,
+	       pstats[edag_tot_t].Ex1 * tsc2ts,
 	       pstats[edag_tot_t].max * tsc2ts,
 	       pstats[edag_tot_t].std * tsc2ts,
-	       pstats[edag_tot_t].avg * pstats[edag_tot_t].n * tsc2ts);
+	       pstats[edag_tot_t].skw * tsc2ts * tsc2ts * tsc2ts,
+	       pstats[edag_tot_t].kurt * tsc2ts * tsc2ts * tsc2ts * tsc2ts,
+	       pstats[edag_tot_t].Ex1 * pstats[edag_tot_t].n * tsc2ts);
 
 	    TR("%-16lf ",
 	       ((*(vcpu->metadata))->dag_ts) * tsc2ts);
@@ -420,12 +471,14 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 		(*(vcpu->metadata))->dag_n) * tsc2ts);
 	    TR("%-15lf ", net_time);
 	    for(i = 0; i < app.num_nodes; i++) {
-		TR("%-15lf %-15lf %-15lf %-15lf %-15lf ",
+		TR("%-15lf %-15lf %-15lf %-15lf %-15lf %-15lf %-15lf ",
 		   pstats[efunc0+i].min * tsc2ts,
-		   pstats[efunc0+i].avg * tsc2ts,
+		   pstats[efunc0+i].Ex1 * tsc2ts,
 		   pstats[efunc0+i].max * tsc2ts,
 		   pstats[efunc0+i].std * tsc2ts,
-		   pstats[efunc0+i].avg * pstats[efunc0+i].n * tsc2ts);
+		   pstats[efunc0+i].skw * tsc2ts * tsc2ts * tsc2ts,
+		   pstats[efunc0+i].kurt * tsc2ts * tsc2ts * tsc2ts * tsc2ts,		   
+		   pstats[efunc0+i].Ex1 * pstats[efunc0+i].n * tsc2ts);
 		/*
 		TR("%-15lf ", ((double)vcpumeta(dag_func_time[i]) /
 			       vcpumeta(dag_tot_proc_inp)) * tsc2ts);
@@ -434,45 +487,38 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    //printf("net_time = %lf\n", net_time);
 	    printf("num dag invocations = %lu\n", (*(vcpu->metadata))->dag_tot_proc_inp);
 	    TR("\n");
-	skip_tr:	    
+#undef TR
+	    if(num_out_print != 0)
+	    {
+		uint64_t *paddr;
+		paddr = (typeof(paddr))((uint8_t*)*(vcpu->shared_mem) + out_off_print);
+		printf("out: ");
+		for(i = 0; i < num_out_print; i++) {
+		    printf("%15.3lf ", ((double)(paddr[i*4+2] / paddr[i*4+3]))*tsc2ts);
+		}
+		printf("\n");
+	    }
+	    printf("Closing result sock\n");
 	    close(result_sock);
-#undef TR	    
 	    exit(-1);
 	}
 	
-	buflen = MB_1 - sizeof(struct t_shm); 
-	{
-	    struct iovec iovec[2];
-	    struct msghdr msg;
-	    uint64_t addr = (uint64_t)*(vcpu->shared_mem);
-	    ((struct t_shm *)addr)->next = NULL;
-	    
-	    iovec[0].iov_base = \
-		(typeof(iovec[0].iov_base))(addr + \
-					    sizeof(struct t_shm));
-	    
-	    iovec[0].iov_len = buflen;
-	    msg.msg_name = vcpu->saddr_f;
-	    msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
-	    msg.msg_iov = iovec;
-	    msg.msg_iovlen = 1;
-	    msg.msg_control = NULL;
-	    msg.msg_controllen = 0;
-	    msg.msg_flags = 0;
-
-	    ts(t1_net);
-	    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
-	    if(buflen <= 0)
-		fatal("recvmsg returns error\n");
-	    //print_hex(addr, 64);
-	    //printf("buflen = %d\n", buflen);
-	    ts(t2_net);
-	    net_time += dt(t2_net, t1_net);
-	    
+	ts(t1_net);
+	switch(conn_type) {
+	case eraw:
+	    getinp_raw(vcpu);
+	    break;
+	case etcp:
+	    getinp_tcp(vcpu, app.msg_len);
+	    break;
+	default:
+	    fatal("Unknown conn_type = %d\n", conn_type);
+	    break;
 	}
-	if(buflen <= 0)
-	    printf("bad buflen %d\n", buflen);
-
+	//print_hex(addr, 64);
+	//printf("buflen = %d\n", buflen);
+	ts(t2_net);
+	net_time += dt(t2_net, t1_net);
 	pktcnt++;
 	
 	break;
@@ -625,23 +671,6 @@ static inline int handle_io_port(t_vcpu *vcpu)
     return 0;
 }
 
-static struct sock_filter code[] = {
-    { 0x28, 0, 0, 0x0000000c },
-    { 0x15, 0, 4, 0x00000800 },
-    { 0x20, 0, 0, 0x0000001a },
-    { 0x15, 8, 0, 0x0a1046f0 },
-    { 0x20, 0, 0, 0x0000001e },
-    { 0x15, 6, 7, 0x0a1046f0 },
-    { 0x15, 1, 0, 0x00000806 },
-    { 0x15, 0, 5, 0x00008035 },
-    { 0x20, 0, 0, 0x0000001c },
-    { 0x15, 2, 0, 0x0a1046f0 },
-    { 0x20, 0, 0, 0x00000026 },
-    { 0x15, 0, 1, 0x0a1046f0 },
-    { 0x6, 0, 0, 0x00040000 },
-    { 0x6, 0, 0, 0x00000000 },
-};
-
 int get_vm(struct vm *vm)
 {
     int i;
@@ -697,11 +726,7 @@ int get_vm(struct vm *vm)
     sem_init(&sem_work_wait, 0, 0);
     sem_init(&sem_work_fin, 0, 0);
 
-    vm->sock_f = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
-    if(vm->sock_f < 0)
-	fatal("cannot create sock for the flow\n");
     vm->sockaddr_f_len = sizeof(vm->saddr_f);
-    printf("sock listening on br0\n");    
     
     vm->metadata->bit_map_inactive_cpus = ~0;
     vm->metadata->num_active_cpus = 0;
@@ -948,7 +973,7 @@ void snapshot_vm(struct vm *vm)
 int tcp_listen_on(int port, int max_listen) {
     int sockfd, itrue;
     struct sockaddr_in servaddr;
-    
+    socklen_t len;
     sockfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if(sockfd == -1)
 	fatal("Unable to get a socket");
@@ -961,6 +986,12 @@ int tcp_listen_on(int port, int max_listen) {
             sizeof(servaddr)) != 0) {
 	fatal("Unable to bind the socket on %d\n", port);
     }
+    len = sizeof(servaddr);
+    if (getsockname(sockfd, (struct sockaddr *)&servaddr,
+		    &len) == -1) {
+	fatal("getsockname error\n");
+    }
+
     if(listen(sockfd, max_listen) != 0) {
         fatal("listen failed max_liste = %d\n", max_listen);
     }
@@ -975,7 +1006,7 @@ int setup_usercode_mmap(struct vm *vm)
     int sockfd, clifd, len;
     char buf[128], *tcpbuf;
     int n, tot;
-    struct sockaddr_in servaddr, cli;
+    struct sockaddr_in cli;
     pid_t c_pid;
     struct rt_exec_path_name *u_exec = app.exec;
     
@@ -990,15 +1021,56 @@ read_again:
 	if(tot >= sizeof(app))
 	    break;
     }
+    {
+        int sockfd_fin;
+        char done_str[] = "Done";
+        if((sockfd_fin = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+            fatal("Unable to open fin socket\n");
+        connect_to(sockfd_fin,
+                   app.result_ip,
+                   APP_FIN_PORT);
+        write(sockfd_fin, done_str, sizeof(done_str)+1);
+        close(sockfd_fin);
+    }
+    printf("Rxed app defn\n");
+    if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+	fatal("unable to open result socket\n");
+    if(app.result_port <= 0)
+	fatal("result port is less than 0\n");
+    printf("Connecting to %s ip, at port %d\n", app.result_ip,
+	   app.result_port);
+    wait_s = 2;
+    while(connect_to(result_sock,
+		     app.result_ip,
+		     app.result_port)) {
+	sleep(1);
+	wait_s--;
+	if(wait_s < 0)
+	    fatal("timeout for connecting to result socket\n");
+    }
+    if(strcmp(app.conn_type, "raw") == 0) {
+	conn_type = eraw;
+    }
+    else if (strcmp(app.conn_type, "tcp") == 0) {
+	conn_type = etcp;
+	if(app.conn_port <= 0)
+	    fatal("bad conn_port %d\n", app.conn_port);
+	tcp_server_sock = tcp_listen_on(app.conn_port, 1);
+	printf("Listening on port %d\n", app.conn_port);
+    }
     ts(t1);
     if((c_pid = fork()) != 0) {
 	close(clifd);
+	close(result_sock);
+	close(tcp_server_sock);
 	goto read_again;
     }
     else {
 	vm->pid = getpid();
+	// not closing sockfd, because will come in boot path, exit will any
+	// way close the sockfd
 	//printf("pid = %d\n", vm.pid);
-    }
+    } 
     vm->metadata->num_nodes = app.num_nodes;
 
     memcpy(vm->metadata->dag, app.dag, sizeof(app.dag));
@@ -1663,6 +1735,49 @@ int connect_to(int sockfd, char ip[], int port)
     return ret;
 }
 
+int getinp_raw(t_vcpu *vcpu) {
+    struct iovec iovec[2];
+    struct msghdr msg;
+    uint64_t addr = (uint64_t)*(vcpu->shared_mem);
+    ((struct t_shm *)addr)->next = NULL;
+    int buflen;
+    buflen = MB_1 - sizeof(struct t_shm); 	    
+    iovec[0].iov_base =				   \
+	(typeof(iovec[0].iov_base))(addr +				\
+				    sizeof(struct t_shm));
+    
+    iovec[0].iov_len = buflen;
+    msg.msg_name = vcpu->saddr_f;
+    msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
+    msg.msg_iov = iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = NULL;
+    msg.msg_controllen = 0;
+    msg.msg_flags = 0;    
+    buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
+    if(buflen <= 0)
+	fatal("recvmsg returns error: %d\n", buflen);
+
+    return 0;
+}
+
+int getinp_tcp(t_vcpu *vcpu, int len) {
+    int tot, n;
+    uint8_t *tcpbuf;
+    uint64_t addr = (uint64_t)*(vcpu->shared_mem);
+    //((struct t_shm *)addr)->next = NULL;	
+    // big packet, read till you get everything!
+    tcpbuf = (typeof(tcpbuf))(addr);
+    tot = 0;
+    while((n = read(*(vcpu->sock_f), &tcpbuf[tot], len - tot)) >= 0) {
+	tot += n;
+	if(tot >= len)
+	    break;
+    }
+
+    return 0;
+}
+
 int read_file(char b[], int bs, const char fname[]) {
     int i, rd, n;
     FILE *fp;
@@ -1688,26 +1803,58 @@ t_pstat t_pstat_constructor()
     s.n = 0;
     s.max = 0;
     s.min = INFINITY;
-    s.avg = 0;
+    s.Ex1 = 0;
     s.Ex2 = 0;
+    s.Ex3 = 0;
+    s.Ex4 = 0;
     s.std = 0;
+    s.skw = 0;
+    s.kurt = 0;
     s.update_stat = t_pstat_update_stat;
 
     return s;
 }
 void t_pstat_update_stat(t_pstat *stat, double cur)
 {
-    double cur2;
-    double np1;
+    double cur2, cur3, cur4;
+    double np1, np1_2, s1, s2, s3, s4;
+    double sig2, sig3, sig4, nEx1, nEx2, nEx3, nEx4;
+    double nEx1_2, nEx1_3, nEx1_4;
     cur2 = cur*cur;
+    cur3 = cur2*cur;
+    cur4 = cur3*cur;
     np1 = stat->n + 1;
+    np1_2 = np1*np1;
     stat->cur = cur;
     stat->max = max(stat->max, stat->cur);
     stat->min = min(stat->min, stat->cur);
-    stat->avg = ((stat->avg * stat->n) + stat->cur) / (np1);
-    stat->Ex2 = ((stat->Ex2 * stat->n) + cur2) / (np1);
-    stat->std = sqrt(stat->Ex2 - (stat->avg)*(stat->avg));
+#define Ex(n) (stat->Ex ## n)
+    
+    Ex(1) = Ex(1) - Ex(1)/np1 + cur/np1;
+    Ex(2) = Ex(2) - Ex(2)/np1 + cur2/np1;
+    Ex(3) = Ex(3) - Ex(3)/np1 + cur3/np1;
+    Ex(4) = Ex(4) - Ex(4)/np1 + cur4/np1;
+
+    sig2 = Ex(2) - Ex(1);    
+    stat->std = sqrt(sig2);
+#define sig (stat->std)
+    sig3 = sig2 * stat->std;
+    sig4 = sig2 * sig2;
+
+    nEx1 = Ex(1) / sig;
+    nEx2 = Ex(2) / sig2;
+    nEx3 = Ex(3) / sig3;
+    nEx4 = Ex(4) / sig4;
+    nEx1_2 = nEx1 * nEx1;
+    nEx1_3 = nEx1_2 * nEx1;
+    nEx1_4 = nEx1_2 * nEx1_2;
+    stat->skw = nEx3 - 3.0*nEx1 - nEx1_3;
+    stat->kurt = nEx4 - 4.0*nEx1*nEx3 +
+	6.0*nEx1_2 + 3.0*nEx1_4;
     stat->n = np1;
+    
+#undef Ex
+#undef sig
 }
 /*
   dag repr:
