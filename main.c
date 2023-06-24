@@ -61,7 +61,7 @@
 #define vcpumeta(v) ((*(vcpu->metadata))->v)
 #define declobj(type, var_name) type var_name = type ## _ ## constructor()
 #define	update_stat(o, v) (o)->update_stat(o, v)
-    
+
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
@@ -91,7 +91,7 @@ typedef struct t_pstat {
     double kurt;
     void (*update_stat)(struct t_pstat *stat, double cur);
 } t_pstat;
-    
+
 struct t_page_table {
     uint64_t e[512];
 };
@@ -100,8 +100,10 @@ struct t_pg_tbls {
     struct t_page_table tbl[2];
 };
 
+struct vm;
 typedef struct
 {
+    struct vm *vm;
     int vcpufd;
     uint8_t id;
     uint8_t pool_size;
@@ -146,6 +148,7 @@ struct vm {
     int ncpu;
     int slot_no;
     t_vcpu *vcpu;
+    int rand_num;
     uint64_t entry;
     struct func_prop kprop;
     uint64_t stack_start;
@@ -197,8 +200,8 @@ static int result_sock, wait_s, tcp_server_sock;
 #define GP2HV(x)  (gp2hv[((x) >> 21)] + ((x) & (MB_2 - 1)))
 static struct app_defn_t app;
 
-static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}' > tmp/private.txt";
-static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}' > tmp/pss.txt";
+static const char sprintf_cmd_private_page[] = "cat %s | grep -i -E '^Private_.*:' | awk '//{s+=$2}END{print s}' > tmp/private%d.txt";
+static const char sprintf_cmd_pss[] = "cat %s | grep -i '^pss' | awk '//{s+=$2}END{print s}' > tmp/pss%d.txt";
 static struct sock_filter code[] = {
     { 0x28, 0, 0, 0x0000000c },
     { 0x15, 0, 4, 0x00000800 },
@@ -216,7 +219,8 @@ static struct sock_filter code[] = {
     { 0x6, 0, 0, 0x00000000 },
 };
 
-int tcp_listen_on(int port, int max_listen);
+int tcp_listen_on(int *port, int max_listen);
+void fin_sock(int sock);
 int getinp_raw(t_vcpu *vcpu);
 int getinp_tcp(t_vcpu *vcpu, int len);
 
@@ -260,7 +264,6 @@ int main(int argc, char *argv[])
 {
     int i, ret;
     uint64_t gpa;
-    
     for(i = 1; i < argc;) {
 	if(strcmp(argv[i], "vcpu") == 0) {
 	    if(i+1 >= argc)
@@ -287,7 +290,7 @@ int main(int argc, char *argv[])
 	if(strcmp(argv[i], "parg") == 0) {
 	    if(i+2 >= argc)
 		fatal("provide option for %s\n", argv[i]);
-	    
+
 	    if(sscanf(argv[i+1], "%d", &out_off_print) != 1) {
 		printf("provide numeric argument to %s\n", argv[i]);
 		exit(-1);
@@ -303,9 +306,9 @@ int main(int argc, char *argv[])
 	    printf("%s,offset=%d,num2print=%d\n", argv[i],out_off_print, num_out_print);
 	    i+=3;
 	    continue;
-	}	
+	}
     }
-    
+
     init_limits(limit_file);
     setup_bootcode_mmap(&vm); // 750 us
     setup_usercode_mmap(&vm); // 290 us
@@ -313,7 +316,7 @@ int main(int argc, char *argv[])
     //printf("(after funcs mmap)\nprivate_clean + private_dirty + private_hugetlb(kB):\n");
     //fflush(stdout);
     dump_self_smaps();
-    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
+    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name, vm.pid);
     system(str_sys_cmd);
     // wait for client app connection here
     get_vm(&vm); // 500 us
@@ -322,7 +325,7 @@ int main(int argc, char *argv[])
     vm.ncpu = runtime_vcpus;
     setup_vcpus(&vm); // 200 us    (2500 for 64 vcpus)
     register_umem_mmap(&vm);
-    sem_post(&sem_usercode_loaded);    
+    sem_post(&sem_usercode_loaded);
     //snapshot_vm(&vm);
     //setup_irqfd(&vm, 1);
     setup_device_loop(&vm); // start device thread
@@ -342,7 +345,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 {
     int i;
     int ret = 0, len, fn;
-    int buflen;
+    int buflen = 0;
     static double net_time = 0.0, cold_dag_tsc_time;
     static uint64_t cold_req_time;
     struct sockaddr_in cli;
@@ -355,6 +358,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	//ts(t2);
 	//tsc_t2 = tsc();
 	//printf("boot time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);
+	//printf("Booted = %d\n", vcpu->id);
 	sem_post(&sem_booted);
 	// TBD required or not? seems not
 	sem_wait(&sem_usercode_loaded);
@@ -369,27 +373,12 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	    //printf("private_clean + private_dirty + private_hugetlb(kB):\n");
 	    fflush(stdout);
 	    dump_self_smaps();
-	    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name);
+	    sprintf(str_sys_cmd, sprintf_cmd_private_page, smap_file_name, vcpu->vm->pid);
 	    system(str_sys_cmd);
 	    //printf("pss(kB):\n");
 	    fflush(stdout);
-	    sprintf(str_sys_cmd, sprintf_cmd_pss, smap_file_name);
+	    sprintf(str_sys_cmd, sprintf_cmd_pss, smap_file_name, vcpu->vm->pid);
 	    system(str_sys_cmd);
-	    if(conn_type == eraw) {
-		*(vcpu->sock_f) = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
-		printf("sock listening on br0\n");    
-	    }
-	    else if (conn_type = etcp) {
-		printf("accepting the connection\n");
-		*(vcpu->sock_f) = accept(tcp_server_sock, (struct sockaddr *)&cli, &len);
-		printf("Rxed connection\n");
-		close(tcp_server_sock);
-	    }
-	    else
-		fatal("Unknown conn_type");
-	    if(*(vcpu->sock_f) <= 0)
-		fatal("cannot create sock for the flow\n");
-	    *(vcpu->sockaddr_f_len) = sizeof(*(vcpu->saddr_f));	    
 	    tsc_t1 = tsc();
 	    //printf("ts(t1)\n");
 	    ts(t1);
@@ -423,7 +412,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	if(pktcnt >= app.pktcnt) {
 	    ts(t2);
 	    tsc_t2 = tsc();
-	    printf("Sched_getcpu = %d\n", sched_getcpu());
+	    //printf("Sched_getcpu = %d\n", sched_getcpu());
 	    tsc2ts = (double)(dt(t2, t1)) / (double)(tsc_t2 - tsc_t1);
 #define TR(...)	tr_result(result_sock, result_buf, ##__VA_ARGS__)
 	    // boot time is us
@@ -477,7 +466,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 		   pstats[efunc0+i].max * tsc2ts,
 		   pstats[efunc0+i].std * tsc2ts,
 		   pstats[efunc0+i].skw * tsc2ts * tsc2ts * tsc2ts,
-		   pstats[efunc0+i].kurt * tsc2ts * tsc2ts * tsc2ts * tsc2ts,		   
+		   pstats[efunc0+i].kurt * tsc2ts * tsc2ts * tsc2ts * tsc2ts,
 		   pstats[efunc0+i].Ex1 * pstats[efunc0+i].n * tsc2ts);
 		/*
 		TR("%-15lf ", ((double)vcpumeta(dag_func_time[i]) /
@@ -485,7 +474,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 		*/
 	    }
 	    //printf("net_time = %lf\n", net_time);
-	    printf("num dag invocations = %lu\n", (*(vcpu->metadata))->dag_tot_proc_inp);
+	    //printf("num dag invocations = %lu\n", (*(vcpu->metadata))->dag_tot_proc_inp);
 	    TR("\n");
 #undef TR
 	    if(num_out_print != 0)
@@ -498,11 +487,13 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 		}
 		printf("\n");
 	    }
-	    printf("Closing result sock\n");
-	    close(result_sock);
+	    //printf("FIN\n");
+	    fin_sock(*(vcpu->sock_f));
+	    if(*(vcpu->sock_f) != result_sock)
+		close(result_sock);
 	    exit(-1);
 	}
-	
+
 	ts(t1_net);
 	switch(conn_type) {
 	case eraw:
@@ -520,7 +511,7 @@ int decode_msg(t_vcpu *vcpu, uint16_t msg)
 	ts(t2_net);
 	net_time += dt(t2_net, t1_net);
 	pktcnt++;
-	
+
 	break;
     default:
 	fatal("Unknown msg from the guest");
@@ -555,7 +546,7 @@ void* pt_walk(uint64_t cr3, uint64_t addr)
 
     e = GP2HV(p2e);
     return (void *)(e + (addr & (MB_2-1)));
-    
+
 }
 void handle_syscall(t_vcpu *vcpu, uint16_t nr)
 {
@@ -568,7 +559,7 @@ void handle_syscall(t_vcpu *vcpu, uint16_t nr)
     ret = ioctl(vcpu->vcpufd, KVM_GET_SREGS, &vcpu->sregs);
     if(ret == -1)
 	fatal("cant read sregs\n");
-    
+
     rdi = vcpu->regs.rdi;
     rsi = vcpu->regs.rsi;
     rcx = vcpu->regs.rcx;
@@ -604,7 +595,7 @@ static inline int handle_io_port(t_vcpu *vcpu)
     char c;
     int ret;
     uint16_t nr;
-    
+
     switch(vcpu->run->io.port) {
     case PORT_SYSCALL:
 	if (vcpu->run->io.direction == KVM_EXIT_IO_OUT &&
@@ -629,6 +620,7 @@ static inline int handle_io_port(t_vcpu *vcpu)
 	ts(t2);
 	printf("time = %ld, tsc_time = %ld\n", dt(t2, t1), (tsc_t2 - tsc_t1) / 3400);
 	printf("Halt port IO\n");
+	    printf("pktcnt = %d\n", pktcnt);
 	print_regs(vcpu);
 	exit(-1);
 	return 1;
@@ -676,7 +668,7 @@ int get_vm(struct vm *vm)
     int i;
     int kvm, ret;
     int err, nent;
-    
+
     err = 0;
     kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if(kvm == -1) {
@@ -727,7 +719,7 @@ int get_vm(struct vm *vm)
     sem_init(&sem_work_fin, 0, 0);
 
     vm->sockaddr_f_len = sizeof(vm->saddr_f);
-    
+
     vm->metadata->bit_map_inactive_cpus = ~0;
     vm->metadata->num_active_cpus = 0;
     vm->slot_no = 0;
@@ -746,9 +738,9 @@ void *create_vcpu(void *vvcpu)
     pthread_t pid;
     int core_id;
     cpu_set_t cpuset;
-    
+
     CPU_ZERO(&cpuset);
-    /* 
+    /*
     // depend on linux sched for affinity within pcpus
     core_id = isol_core_start;
     for(i = 0; i < runtime_pcpus; i++) {
@@ -757,14 +749,14 @@ void *create_vcpu(void *vvcpu)
     core_id += 1;
     }
     */
-    
+
     // distribute eventy, 1 core per pcpu
-    core_id = isol_core_start + (vcpu->id) % runtime_pcpus;
+    core_id = isol_core_start + (vcpu->id + vcpu->vm->rand_num) % runtime_pcpus;
     CPU_SET(core_id, &cpuset);
     // pin cpu thread to a cpu set
     if(pthread_setaffinity_np(vcpu->tid, sizeof(cpuset), &cpuset))
 	fatal("pthread_setaffinity_np failed, pinning\n");
-    
+
     //ts(t1);
 #ifdef __IRQCHIP__
     if(ioctl(vcpu->vcpufd, KVM_GET_LAPIC, &lapic_state)) {
@@ -795,6 +787,8 @@ void *create_vcpu(void *vvcpu)
     //printf("cs.selector = %llX\n",vcpu->sregs.cs.selector);
     vcpu->sregs.cs.base = 0;
     vcpu->sregs.cs.selector = 0;
+    vcpu->sregs.gs.base = 0;
+    vcpu->sregs.gs.selector = 0;
     if(ioctl(vcpu->vcpufd, KVM_SET_SREGS, &(vcpu->sregs)) < 0)
 	fatal("cant set seg sregs tid = %ld\n", vcpu->tid);
 
@@ -839,6 +833,7 @@ void *create_vcpu(void *vvcpu)
 		return NULL;
 	    break;
 	case KVM_EXIT_SHUTDOWN:
+	    printf("pktcnt = %d\n", pktcnt);
 	    print_regs(vcpu);
 	    fatal("KVM_EXIT_SHUTDOWN\n");
 	    break;
@@ -868,8 +863,9 @@ void setup_vcpus(struct vm *vm)
     vm->vcpu = calloc(vm->ncpu, sizeof(*(vm->vcpu)));
     if(vm->vcpu == NULL)
 	fatal("Cannot allocate vm->vcpu");
-    
+
     for(i = 0; i < vm->ncpu; i++) {
+	vm->vcpu[i].vm = vm;
 	vcpu_id = i;
 	vm->vcpu[i].vcpufd = ioctl(vm->fd, KVM_CREATE_VCPU, vcpu_id);
 	//printf("vcpufd = %d\n", vm->vcpu[i].vcpufd);
@@ -927,17 +923,16 @@ int setup_bootcode_mmap(struct vm *vm)
     FILE *fp;
 
     init_elf64_file(kernel_elf, &elf);
-    
+
     fd = open(kernel_code, O_RDWR);
     if(fd == -1)
 	fatal("Unable to open kernel code\n");
     fstat(fd, &stat);
-    vm->kmem = mmap(NULL, stat.st_size, PROT_READ | PROT_WRITE, \
-		    MAP_PRIVATE, fd, 0);
+    if((vm->kmem = mmap(NULL, stat.st_size, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE, fd, 0)) == MAP_FAILED)
+	fatal("mmap failed for kmem\n");
     close(fd);
     vm->kphy_mem_size = stat.st_size;
-    if(vm->kmem == MAP_FAILED)
-	fatal("mmap of kernel code failed\n");
 
     fp = fopen(kernel_prop, "r");
     if(fp == NULL)
@@ -946,8 +941,8 @@ int setup_bootcode_mmap(struct vm *vm)
     fread(&(vm->kprop), sizeof(vm->kprop), 1, fp);
     fclose(fp);
 
-    
-    vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);    
+
+    vm->metadata = (struct t_metadata *)&(vm->kmem[0x0008]);
     // TBD Compatibility
     vm->entry = vm->kprop.entry;
     vm->stack_start = vm->kprop.stack_load_addr;
@@ -970,10 +965,13 @@ void snapshot_vm(struct vm *vm)
 {
 }
 
-int tcp_listen_on(int port, int max_listen) {
+int tcp_listen_on(int *port, int max_listen)
+{
     int sockfd, itrue;
     struct sockaddr_in servaddr;
     socklen_t len;
+    if(port == NULL)
+	fatal("port is NULL\n");
     sockfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if(sockfd == -1)
 	fatal("Unable to get a socket");
@@ -981,15 +979,22 @@ int tcp_listen_on(int port, int max_listen) {
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &itrue, sizeof(int));
     servaddr.sin_family = AF_INET;
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(port);
+    if(*port != 0)
+	servaddr.sin_port = htons(*port);
+    else
+	servaddr.sin_port = 0; // auto assign port
     if(bind(sockfd, (struct sockaddr *)&servaddr,
             sizeof(servaddr)) != 0) {
-	fatal("Unable to bind the socket on %d\n", port);
+	fatal("Unable to bind the socket on %d\n", *port);
     }
-    len = sizeof(servaddr);
-    if (getsockname(sockfd, (struct sockaddr *)&servaddr,
-		    &len) == -1) {
-	fatal("getsockname error\n");
+    if(port != NULL) {
+	len = sizeof(servaddr);
+	if (getsockname(sockfd, (struct sockaddr *)&servaddr,
+			&len) == -1) {
+	    fatal("getsockname error\n");
+	}
+	// get port number
+	*port = ntohs(servaddr.sin_port);
     }
 
     if(listen(sockfd, max_listen) != 0) {
@@ -1009,10 +1014,19 @@ int setup_usercode_mmap(struct vm *vm)
     struct sockaddr_in cli;
     pid_t c_pid;
     struct rt_exec_path_name *u_exec = app.exec;
-    
-    sockfd = tcp_listen_on(SERVER_PORT, MAX_LISTEN);
-read_again:
+    int server_port;
+    server_port = SERVER_PORT;
+    sockfd = tcp_listen_on(&server_port, MAX_LISTEN_APP);
+    fflush(stdout);
+look_for_new_app:
     clifd = accept(sockfd, (struct sockaddr *)&cli, &len);
+    if((c_pid = fork()) != 0) {
+	close(clifd);
+	goto look_for_new_app;
+    }
+    else
+	close(sockfd);
+
     tcpbuf = (typeof(tcpbuf))&app;
     // big packet, read till you get everything!
     tot = 0;
@@ -1021,6 +1035,8 @@ read_again:
 	if(tot >= sizeof(app))
 	    break;
     }
+    printf("Rxed app defn\n");
+    /*
     {
         int sockfd_fin;
         char done_str[] = "Done";
@@ -1032,57 +1048,93 @@ read_again:
         write(sockfd_fin, done_str, sizeof(done_str)+1);
         close(sockfd_fin);
     }
-    printf("Rxed app defn\n");
-    if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-	fatal("unable to open result socket\n");
-    if(app.result_port <= 0)
-	fatal("result port is less than 0\n");
-    printf("Connecting to %s ip, at port %d\n", app.result_ip,
-	   app.result_port);
-    wait_s = 2;
-    while(connect_to(result_sock,
-		     app.result_ip,
-		     app.result_port)) {
-	sleep(1);
-	wait_s--;
-	if(wait_s < 0)
-	    fatal("timeout for connecting to result socket\n");
-    }
+    */
     if(strcmp(app.conn_type, "raw") == 0) {
 	conn_type = eraw;
     }
     else if (strcmp(app.conn_type, "tcp") == 0) {
 	conn_type = etcp;
-	if(app.conn_port <= 0)
+	if(app.conn_port < 0)
 	    fatal("bad conn_port %d\n", app.conn_port);
-	tcp_server_sock = tcp_listen_on(app.conn_port, 1);
+	tcp_server_sock = tcp_listen_on(&app.conn_port, MAX_LISTEN_CLIENT);
 	printf("Listening on port %d\n", app.conn_port);
     }
-    ts(t1);
-    if((c_pid = fork()) != 0) {
-	close(clifd);
-	close(result_sock);
-	close(tcp_server_sock);
-	goto read_again;
+    
+    {
+	uint16_t ns_port = htons(app.conn_port);
+	write(clifd, &ns_port, sizeof(ns_port));
     }
-    else {
+    close(clifd);
+new_client_for_app:
+    if(conn_type == eraw) {
+	vm->sock_f = get_sock_for_flow(code, ARR_SZ_1D(code), "br0");
+	printf("sock listening on br0\n");
+    }
+    else if (conn_type = etcp) {
+	//printf("accepting the connection\n");
+	len = sizeof(cli);
+	vm->sock_f = accept(tcp_server_sock, (struct sockaddr *)&cli, &len);
+	if(vm->sock_f <= 0)
+	    fatal("Cannot accept the socket connection\n");
+	//printf("Rxed connection\n");
+    }
+    else
+	fatal("Unknown conn_type");
+
+    if((vm->sock_f) <= 0)
+	fatal("cannot create sock for the flow\n");
+    vm->sockaddr_f_len = sizeof(vm->saddr_f);
+
+    if(conn_type == etcp) 
+	result_sock = vm->sock_f;
+    else if(conn_type == eraw) {
+	if((result_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+	    fatal("unable to open result socket\n");
+	if(app.result_port <= 0)
+	    fatal("result port is less than 0\n");
+	printf("Connecting to %s ip, at port %d\n", app.result_ip,
+	       app.result_port);
+	wait_s = 2;
+	while(connect_to(result_sock,
+			 app.result_ip,
+			 app.result_port)) {
+	    sleep(1);
+	    wait_s--;
+	    if(wait_s < 0)
+		fatal("timeout for connecting to result socket\n");
+	}
+    }
+
+    fflush(stdout);
+    ts(t1);
+    if(conn_type == etcp) {
+	if((c_pid = fork()) != 0) {
+	    close(result_sock);
+	    goto new_client_for_app;
+	}
+	else
+	    vm->pid = getpid();
+    }
+    else
 	vm->pid = getpid();
-	// not closing sockfd, because will come in boot path, exit will any
-	// way close the sockfd
-	//printf("pid = %d\n", vm.pid);
-    } 
+
+    {
+	time_t t;
+	srand((unsigned) time(&t));
+    }
+    vm->rand_num = rand();
     vm->metadata->num_nodes = app.num_nodes;
 
     memcpy(vm->metadata->dag, app.dag, sizeof(app.dag));
     memset(vm->metadata->current, NULL_FUNC, sizeof(vm->metadata->current));
     vm->metadata->start_func = 0;
-    
+
     vm->shared_mem =						\
 	(uint8_t *)mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, \
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if(vm->shared_mem == MAP_FAILED)
 	fatal("shared mapping failed\n");
-    
+
     vm->shared_ro =						\
 	(uint8_t *)mmap(NULL, SHARED_RO_SIZE, PROT_READ | PROT_WRITE,	\
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1093,11 +1145,11 @@ read_again:
 	if(i%2 == 0)
 	    vm->shared_ro[i] = 0xaa;
 	if(i%2 == 1)
-	    vm->shared_ro[i] = 0x55;	
+	    vm->shared_ro[i] = 0x55;
     }
     if(mprotect(vm->shared_ro, SHARED_RO_SIZE, PROT_READ))
 	fatal("unable to update shared_ro PROT bits\n");
-    
+
     vm->num_exec = 0;
     for(i = 0; i < ARR_SZ_1D(vm->exec_deps); i++) {
 	if(u_exec[i].name[0] == '\0' || i > app.num_nodes)
@@ -1112,7 +1164,7 @@ read_again:
 	    fatal("The inp(%d) or out(%d) offsets are beyond %d",
 		  inp_off, out_off, SHM_SIZE);
 	vm->exec_deps[i].exec[0].func_prop.inp_off = inp_off;
-	vm->exec_deps[i].exec[0].func_prop.out_off = out_off;	
+	vm->exec_deps[i].exec[0].func_prop.out_off = out_off;
 	vm->num_exec++;
     }
 }
@@ -1166,7 +1218,7 @@ void register_umem_mmap(struct vm *vm)
     uint64_t gp_mem, gp_shm, gp_shc, gp_shro;
     uint64_t hv_kmem, templ_boot_p3, shared_ro_page;
     struct lib_deps *dep;
-    
+
     gp_mem = vm->kphy_mem_size; // end of k pages
     gp_pt = (uint64_t *)vm->kern_end;
     hv_kmem = (uint64_t)vm->kmem;
@@ -1213,7 +1265,7 @@ void register_umem_mmap(struct vm *vm)
 	    (uint64_t)dep->exec[0].func_prop.inp_off;
 	vm->metadata->func_info[fni].out_off =
 	    (uint64_t)dep->exec[0].func_prop.out_off;
-	
+
 	for(j = 0; j < dep->num_exec; j++) {
 	    gp_area = gp_mem;
 	    //printf("registering %s\n", dep->exec[j].name);
@@ -1223,10 +1275,10 @@ void register_umem_mmap(struct vm *vm)
 	    gp_pt += 512;
 	    p2 = (typeof(p2))H2G(hv_kmem, gp_pt[0]);
 	    num_pages = SZ2PAGES(dep->exec[j].mm_size);
-	    if(j == 0) { //for the main function 
+	    if(j == 0) { //for the main function
 		p2[0] = gp_shm | 0x087;
 		// TBD based on SHARED_PAGES & PAGES_SHARED_CODE
-		p2[1] = gp_shc | 0x087;		
+		p2[1] = gp_shc | 0x087;
 		init_pt = 2;
 	    }
 	    else { // for its dependent libraries
@@ -1273,8 +1325,8 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
     dep_lib_start = (uint64_t)sym_p3e * (uint64_t)GB_1;
     offset = rel->offset;
     //printf("act e_start = %016lX\n", e_start);
-    //printf("act sym_e_start = %016lX\n", sym_e_start);  
-    
+    //printf("act sym_e_start = %016lX\n", sym_e_start);
+
     //printf("%s, mm_p3e = %d,dep_lib_start = %016lX\n", rel->name, mm_p3e, dep_lib_start);
     /*
       printf("0:offset = %016lX\nvalue = %016lX\ne_start=%016lX\n",
@@ -1286,13 +1338,13 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
     value_va = value + dep_lib_start;
 /*
   printf("1:offset = %016lX\nvalue = %016lX\nvalue_va=%016lX\n",
-  offset, value, value_va); 
+  offset, value, value_va);
 */
-    
-    
+
+
     //printf("sym_p3e = %d\n", sym_p3e);
     dst = (typeof(dst))(&mm[offset]);
-	
+
     // only global and default i can understand
     if((ELF64_ST_BIND(sym->st_info) == STB_GLOBAL ||
 	ELF64_ST_BIND(sym->st_info) == STB_WEAK ||
@@ -1308,7 +1360,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 		src = (typeof(src))&value_va;
 		copy_sz = 8;
 		//printf("R_X86_64_GLOB_DAT: value_va = %016lX\n", value_va);
-		break;		
+		break;
 	    case 7: // R_X86_64_JUMP_SLOT
 		value_va += rel->addend;
 		src = (typeof(src))&(value_va);
@@ -1326,7 +1378,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 		value_va += rel->addend;
 		src = &value_va;
 		copy_sz = 8;
-		break;		
+		break;
 	    case 5: // R_X86_64_COPY
 		value += rel->addend;
 		src = (typeof(src))&(mm_sym[value]);
@@ -1344,7 +1396,7 @@ void resolve_this(uint8_t *mm, relocs_t *rel, int mm_p3e,
 		value_va = dep_lib_start + *(uint64_t *)dst;
 		src = &value_va;
 		copy_sz = 8;
-		break;		
+		break;
 	    default:
 		fatal("Unknown rel->type %d\n", rel->type);
 	    }
@@ -1374,7 +1426,7 @@ void resolve_dynsyms(struct vm *vm)
     struct exec_info *e;
     struct lib_deps *dep;
     relocs_t rel;
-    
+
     for(i = 0; i < vm->num_exec; i++) {
 	dep = &(vm->exec_deps[i]);
 	//printf("Resolving: %s\n", dep->exec[0].name);
@@ -1418,14 +1470,14 @@ void resolve_dynsyms(struct vm *vm)
 		if(rel.type == 8) { // R_X86_64_RELATIVE
 		    dep_p3e = e->p3e;
 		    sym = rel.dynsym; // resolve with itself
-		    mm_sym = e->mm;		    
+		    mm_sym = e->mm;
 		    resolve_this(e->mm, &rel, e->p3e,
 				 e->func_prop.min_addr,
 				 mm_sym, sym, dep_p3e,
 				 e->func_prop.min_addr);
 		    continue;
 		}
-#endif		
+#endif
 		for(k = -1; k < e->num_dep; k++) {
 		    if(k == -1) { // check myself first
 			elfd = elf;
@@ -1559,7 +1611,7 @@ void* sock_loop(void *vvm)
       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     */
     /*
-      while(1) { 
+      while(1) {
       buflen = recvfrom(sock, buffer, MB_2, 0, &saddr,
       (socklen_t *)&sockaddr_len);
       if(buflen <= 0)
@@ -1578,7 +1630,7 @@ void setup_device_loop(struct vm *vm)
     if(pthread_create(&vm->tid_tmr, NULL, timer_event_loop, vm))
 	fatal("Count create thread for timer\n");
     if(pthread_create(&vm->tid_sock, NULL, sock_loop, vm))
-	fatal("Count create thread for timer\n");    
+	fatal("Count create thread for timer\n");
 }
 
 void print_segment(struct kvm_segment *seg)
@@ -1642,6 +1694,7 @@ int print_regs(t_vcpu *vcpu)
     printf("cr2    = 0x%016llx\t", vcpu->sregs.cr2);
     printf("cr3    = 0x%016llx\t", vcpu->sregs.cr3);
     printf("cr4    = 0x%016llx\n", vcpu->sregs.cr4);
+    printf("gs     = 0x%016llx\t", vcpu->sregs.gs.base);
     printf("fs     = 0x%016llx\n", vcpu->sregs.fs.base);
     for(i = 0; i < 4; i++)
 	printf("db[%d]  = 0x%016llx\n", i, vcpu->dregs.db[i]);
@@ -1666,19 +1719,19 @@ void sigint_handler(int signum)
     {
 	print_regs(&(vm.vcpu[i]));
     }
-    signal(SIGINT, SIG_DFL); 
+    signal(SIGINT, SIG_DFL);
 }
 
 void install_signal_handlers()
 {
     struct sigaction new_action, old_action;
-    
+
     new_action.sa_handler = sigint_handler;
     sigemptyset(&new_action.sa_mask);
     new_action.sa_flags = 0;
     sigaction(SIGINT, NULL, &old_action);
     sigaction(SIGINT, &new_action, NULL);
-    
+
 }
 
 void print_hex(uint8_t *a, int sz)
@@ -1713,7 +1766,7 @@ void dump_self_smaps()
     }
     fclose(fp);
     fclose(fpw);
-    
+
 }
 
 int connect_to(int sockfd, char ip[], int port)
@@ -1728,24 +1781,31 @@ int connect_to(int sockfd, char ip[], int port)
     servaddr.sin_port = htons(port);
     if (connect(sockfd, (struct sockaddr *)&servaddr,
                 sizeof(servaddr)) != 0) {
-	fatal("connfd failed\n");
+	//fatal("connfd failed\n");
 	ret = -1;
     }
 
     return ret;
 }
 
+void fin_sock(int sock)
+{
+    char done[8];
+    shutdown(sock, SHUT_WR);
+    while(read(sock, done, 1) > 0);
+    close(sock);
+}
 int getinp_raw(t_vcpu *vcpu) {
     struct iovec iovec[2];
     struct msghdr msg;
     uint64_t addr = (uint64_t)*(vcpu->shared_mem);
     ((struct t_shm *)addr)->next = NULL;
     int buflen;
-    buflen = MB_1 - sizeof(struct t_shm); 	    
+    buflen = MB_1 - sizeof(struct t_shm);
     iovec[0].iov_base =				   \
 	(typeof(iovec[0].iov_base))(addr +				\
 				    sizeof(struct t_shm));
-    
+
     iovec[0].iov_len = buflen;
     msg.msg_name = vcpu->saddr_f;
     msg.msg_namelen = (socklen_t )*(vcpu->sockaddr_f_len);
@@ -1753,7 +1813,7 @@ int getinp_raw(t_vcpu *vcpu) {
     msg.msg_iovlen = 1;
     msg.msg_control = NULL;
     msg.msg_controllen = 0;
-    msg.msg_flags = 0;    
+    msg.msg_flags = 0;
     buflen = recvmsg(*(vcpu->sock_f), &msg, 0);
     if(buflen <= 0)
 	fatal("recvmsg returns error: %d\n", buflen);
@@ -1765,7 +1825,7 @@ int getinp_tcp(t_vcpu *vcpu, int len) {
     int tot, n;
     uint8_t *tcpbuf;
     uint64_t addr = (uint64_t)*(vcpu->shared_mem);
-    //((struct t_shm *)addr)->next = NULL;	
+    //((struct t_shm *)addr)->next = NULL;
     // big packet, read till you get everything!
     tcpbuf = (typeof(tcpbuf))(addr);
     tot = 0;
@@ -1829,13 +1889,13 @@ void t_pstat_update_stat(t_pstat *stat, double cur)
     stat->max = max(stat->max, stat->cur);
     stat->min = min(stat->min, stat->cur);
 #define Ex(n) (stat->Ex ## n)
-    
+
     Ex(1) = Ex(1) - Ex(1)/np1 + cur/np1;
     Ex(2) = Ex(2) - Ex(2)/np1 + cur2/np1;
     Ex(3) = Ex(3) - Ex(3)/np1 + cur3/np1;
     Ex(4) = Ex(4) - Ex(4)/np1 + cur4/np1;
 
-    sig2 = Ex(2) - Ex(1);    
+    sig2 = Ex(2) - Ex(1);
     stat->std = sqrt(sig2);
 #define sig (stat->std)
     sig3 = sig2 * stat->std;
@@ -1852,7 +1912,7 @@ void t_pstat_update_stat(t_pstat *stat, double cur)
     stat->kurt = nEx4 - 4.0*nEx1*nEx3 +
 	6.0*nEx1_2 + 3.0*nEx1_4;
     stat->n = np1;
-    
+
 #undef Ex
 #undef sig
 }
