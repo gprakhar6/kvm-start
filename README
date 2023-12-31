@@ -1,0 +1,86 @@
+* KVM Functions Server
+This is a demonstration architecture for the Ataru. 
+
+This is a demonstration code for Ataru. However as of now
+it is tested only in the AMD Machine and it requires the
+kvm-start, bootcode, elf-reader to be in the same directory.
+The functions executing also must reside in the same machine
+which the client from outside through template.txt informs
+the ataru about the absolute path.
+
+This github mostly used to inspect the Ataru architecture in detail
+and as a proof of concept rather than full fledge portable
+production ready system.
+
+This launches the KVM Server, that recieves the request on the
+SERVER_PORT(defined in globvar.h) and opens a connection to the
+client. The client sends the `struct rt_app_defn[]` structure where it
+defines the `conn_port` where the KVM server should open another tcp
+server for that specific rt_app_defn, now the client can connect as
+many functions to this particlar rt_app_defn. In this rt_app_defn, one
+also has to send the path to the function codes, the DAG etc.
+
+Following structures defines an application, which is combination of
+many functions tied together by a DAG
+
+```
+struct rt_exec_path_name {
+    char path[128];
+    char name[64];
+    uint64_t inp_off;
+    uint64_t out_off;
+};
+
+struct app_defn_t {
+    char name[MAX_NAME_LEN_STRUCT_MEMBER];
+    int num_nodes;
+    char conn_type[32];
+    int conn_port;
+    int msg_len;
+    char server_ip[32];
+    char result_ip[32];
+    int result_port;
+    int pktcnt;
+    uint16_t dag[256]; // MAX_DAG_ARR_SZ                                                                                             
+    struct rt_exec_path_name exec[256];
+};
+```
+
+One can use the srd utility, in the function to easily read the structure from
+a text file to the structure, that is needed to be sent to the Ataru KVM Server
+
+Following is the example template defining an edge_detection application.
+
+```
+name            : sobel_function
+num_nodes       : 4
+conn_type       : tcp
+conn_port       : 9981
+msg_len         : 16384
+server_ip       : 10.16.70.246
+result_ip       : 10.16.70.240
+result_port     : 10988
+pktcnt          : 1000
+dag             : 0,1,1,2,0,2,3,4,4,1,2,3,3
+exec[0].path    : /home/prakhar/data/code/shared_user_code/
+exec[0].name    : shared_user_code
+exec[0].inp_off : 0
+exec[0].out_off : 0
+exec[1].path    : /home/prakhar/data/code/sobel/
+exec[1].name    : sobel
+exec[1].inp_off : 0
+exec[1].out_off : 65544
+exec[2].path    : /home/prakhar/data/code/sobel/
+exec[2].name    : sobel
+exec[2].inp_off : 0
+exec[2].out_off : 65544
+exec[3].path    : /home/prakhar/data/code/sobel/
+exec[3].name    : sobel
+exec[3].inp_off : 0
+exec[3].out_off : 65544
+exec[4].path    : /home/prakhar/data/code/sobel/
+exec[4].name    : sobel
+exec[4].inp_off : 0
+exec[4].out_off : 65544
+```
+
